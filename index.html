@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>湖畔美术馆</title>
+    <link rel="stylesheet" href="./src/style.css?v=light14" />
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <div id="app">
+      <aside>
+        <div id="nav-home" class="nav-home">
+          <p class="eyebrow">湖畔美术馆</p>
+          <h1>目录</h1>
+          <button class="nav-card" type="button" data-section="space">
+            <strong>空间信息</strong>
+          </button>
+          <button class="nav-card" type="button" data-section="curate">
+            <strong>虚拟策展</strong>
+          </button>
+        </div>
+        <div id="workspace" hidden>
+          <button class="back" type="button" data-nav="back" aria-label="返回">
+            <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+              <path d="M14.5 5.5 L8 12 l6.5 6.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+          </button>
+          <section id="section-space" hidden>
+            <h1>空间信息</h1>
+            <div class="meta">
+              <div><span>外轮廓</span><strong>17.85 × 12.37 m</strong></div>
+              <div><span>轨道模数</span><strong>3.09 m（3 块展板）</strong></div>
+              <div><span>展板</span><strong>23 块 · 宽 1.03 m</strong></div>
+              <div><span>展板高度（假定）</span><strong>3.20 m</strong></div>
+              <div><span>层高（假定）</span><strong>3.60 m</strong></div>
+              <div><span>北向入口</span><strong>约 1.48 m</strong></div>
+            </div>
+            <div class="controls">
+              <button id="btn-top" class="active" type="button" data-view="top">俯视平面</button>
+              <button id="btn-3d" type="button" data-view="3d">三维透视</button>
+              <button id="btn-fp" type="button" data-view="fp">第一人称</button>
+              <label class="chk">
+                <input id="tog-plan" type="checkbox" />
+                叠加原平面图核对比例
+              </label>
+              <label class="chk">
+                <input id="tog-tracks" type="checkbox" checked />
+                显示天花滑轨
+              </label>
+              <label class="chk">
+                <input id="tog-dims" type="checkbox" checked />
+                显示关键尺寸
+              </label>
+            </div>
+            <div class="legend">
+              <div><i class="wall"></i>白色墙面</div>
+              <div><i class="glass"></i>落地玻璃</div>
+              <div><i class="floor"></i>灰色地面</div>
+              <div><i class="panel"></i>移动展板</div>
+              <div><i class="track"></i>天花滑轨</div>
+              <div><i class="ltrack"></i>灯轨与射灯</div>
+              <div><i class="seat"></i>台阶</div>
+              <div><i class="screen"></i>显示屏</div>
+            </div>
+            <p class="note">
+              比例依据：平面图中黄色轨道网格接近正方形，结合展板宽度 1.03
+              m，按每格可并排 3 块展板（3.09 m）将像素图换算为米制。层高平面图未标注，暂取常规展厅
+              3.6 m，之后可按实测修改。
+            </p>
+          </section>
+          <section id="section-curate" hidden>
+            <h1>虚拟策展</h1>
+            <form id="show-form" class="work-form">
+              <label>展览名称<input name="name" required placeholder="例如：春季展" /></label>
+              <button class="primary" type="submit">新建展览</button>
+            </form>
+            <p id="curate-msg" class="form-msg"></p>
+            <div id="show-list" class="show-list"></div>
+            <div id="show-studio" hidden>
+              <p id="show-now" class="show-now"></p>
+              <div class="controls">
+                <button type="button" data-view="top">俯视平面</button>
+                <button type="button" data-view="3d">三维透视</button>
+                <button type="button" data-view="fp">第一人称</button>
+              </div>
+              <button type="button" class="tool" id="spot-edit" aria-pressed="false">调整射灯</button>
+              <p id="spot-edit-note" class="form-msg" hidden>射灯只能沿灯轨拖动。右键左右转向，上下调整俯仰。展板、作品和装饰暂时不能移动。</p>
+              <div class="tool-col" id="tool-col">
+                <div class="tool poster-row" data-poster="19">
+                  <img class="poster-preview" alt="" hidden />
+                  <span class="tool-label"><strong>西侧海报</strong><small>19 号墙</small></span>
+                  <button type="button" data-act="upload">上传</button>
+                  <button type="button" data-act="remove-poster" hidden>移除</button>
+                  <input type="file" accept="image/*" hidden />
+                </div>
+                <div class="tool poster-row" data-poster="21">
+                  <img class="poster-preview" alt="" hidden />
+                  <span class="tool-label"><strong>东北侧海报</strong><small>21 号墙</small></span>
+                  <button type="button" data-act="upload">上传</button>
+                  <button type="button" data-act="remove-poster" hidden>移除</button>
+                  <input type="file" accept="image/*" hidden />
+                </div>
+              </div>
+              <button type="button" class="tool" id="open-work-dialog">添加作品</button>
+              <details class="fold" id="work-fold" open>
+                <summary>作品列表 <span id="work-count"></span></summary>
+                <div id="work-list" class="work-list"></div>
+              </details>
+              <button type="button" class="tool" id="open-decor-dialog">添加装饰</button>
+              <details class="fold" id="decor-fold" open>
+                <summary>装饰列表 <span id="decor-count"></span></summary>
+                <div id="decor-list" class="work-list"></div>
+              </details>
+            </div>
+          </section>
+        </div>
+      </aside>
+      <div id="viewport">
+        <div id="compass" aria-label="指南针，上方为南">
+          <div class="rose" id="rose">
+            <b class="dir s">南</b>
+            <b class="dir e">东</b>
+            <b class="dir w">西</b>
+            <b class="dir n">北</b>
+            <span class="needle"></span>
+          </div>
+        </div>
+        <div class="hud">
+          <div class="scale">
+            <span id="scale-label">5 m</span>
+            <div class="scale-bar" id="scale-bar"></div>
+          </div>
+          <div class="view-tag" id="view-tag">俯视平面</div>
+        </div>
+        <div id="art-cursor" hidden></div>
+      </div>
+    </div>
+    <div id="work-dialog" class="modal" hidden>
+      <form id="work-form" class="modal-card work-form">
+        <h2>添加作品</h2>
+        <label>作品名称<input name="title" required placeholder="例如：春水" /></label>
+        <label>作者<input name="artist" placeholder="作者姓名" /></label>
+        <label>年份<input name="year" placeholder="2026" /></label>
+        <label>说明<textarea name="note" rows="2" placeholder="材质、尺寸或策展备注"></textarea></label>
+        <label>图片<input name="image" type="file" accept="image/*" /></label>
+        <div class="modal-actions">
+          <button type="button" data-dialog="cancel">取消</button>
+          <button class="primary" type="submit">确认</button>
+        </div>
+      </form>
+    </div>
+    <div id="decor-dialog" class="modal" hidden>
+      <div class="modal-card decor-dialog-card">
+        <h2>添加装饰</h2>
+        <p class="form-msg">点一件，它会跟着鼠标。在地面上点击放下。跟着鼠标时，右键拖动可绕自身转一圈，右键点击可删除。放下之后可以拖动改位置，右键拖动绕自身旋转。</p>
+        <div id="decor-catalog"></div>
+        <div class="modal-actions">
+          <button type="button" data-dialog="cancel">关闭</button>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="./src/main.js?v=light14"></script>
+  </body>
+</html>
