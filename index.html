@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="gallery-data-repo" content="evaloooo529/hupan-museum-shows" />
     <title>湖畔美术馆</title>
-    <link rel="stylesheet" href="./src/style.css?v=light41" />
+    <link rel="stylesheet" href="./src/style.css?v=light42" />
     <script type="importmap">
       {
         "imports": {
@@ -86,7 +86,7 @@
                 <button type="button" data-view="fp">第一人称</button>
               </div>
               <button type="button" class="tool" id="spot-edit" aria-pressed="false">调整射灯</button>
-              <p id="spot-edit-note" class="form-msg" hidden>射灯只能沿灯轨拖动。右键左右转向，上下调整俯仰。展板、作品和装饰暂时不能移动。</p>
+              <p id="spot-edit-note" class="form-msg" hidden>射灯只能沿灯轨拖动。右键或双指拖动可左右转向、上下俯仰。展板、作品和装饰暂时不能移动。</p>
               <div class="tool-col" id="tool-col">
                 <div class="tool poster-row" data-poster="19">
                   <img class="poster-preview" alt="" hidden />
@@ -196,7 +196,7 @@
     <div id="install-dialog" class="modal" hidden>
       <form id="install-form" class="modal-card work-form">
         <h2>添加装置</h2>
-        <p class="form-msg">导入 STL 后，装置会跟着鼠标。在地面上点击放下。跟着鼠标时，右键拖动可绕自身转一圈，右键点击可删除。放下之后可以拖动改位置，拖透明圆点改大小，右键拖动绕自身旋转。</p>
+        <p class="form-msg">导入 STL 后，装置会跟着指针。在地面上点击放下。跟着指针时，右键或双指拖动可绕自身转一圈，右键或双指点按可删除。放下之后可以拖动改位置，拖透明圆点改大小，右键或双指拖动绕自身旋转。</p>
         <label>装置名称<input name="title" required placeholder="例如：栖息" /></label>
         <label>作者<input name="artist" placeholder="作者姓名" /></label>
         <label>年份<input name="year" placeholder="2026" /></label>
@@ -212,7 +212,7 @@
     <div id="decor-dialog" class="modal" hidden>
       <div class="modal-card decor-dialog-card">
         <h2>添加装饰</h2>
-        <p class="form-msg">点一件，它会跟着鼠标。在地面上点击放下。跟着鼠标时，右键拖动可绕自身转一圈，右键点击可删除。放下之后可以拖动改位置，右键拖动绕自身旋转。</p>
+        <p class="form-msg">点一件，它会跟着指针。在地面上点击放下。跟着指针时，右键或双指拖动可绕自身转一圈，右键或双指点按可删除。放下之后可以拖动改位置，右键或双指拖动绕自身旋转。</p>
         <div id="decor-catalog"></div>
         <div class="modal-actions">
           <button type="button" data-dialog="cancel">关闭</button>
@@ -222,13 +222,14 @@
     <div id="github-gate" class="github-gate" hidden>
       <form id="github-form">
         <h1>连接 GitHub</h1>
-        <p>粘贴一个可以读写私有仓库的 GitHub 令牌。它只保存在这台设备的浏览器里，用来在不同设备之间同步同一份策展。</p>
+        <p>粘贴一个可以读写私有仓库 <strong>hupan-museum-shows</strong> 的 GitHub 令牌。它只保存在这台设备的浏览器里，用来在不同设备之间同步同一份策展。</p>
+        <p><a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noreferrer">在 GitHub 新建一个细粒度令牌</a>，只勾选仓库 hupan-museum-shows，权限里勾选 Contents（内容），级别选 Read and write。</p>
         <label>令牌<input name="token" type="password" autocomplete="off" required placeholder="github_pat_…" /></label>
         <label id="github-repo-label">仓库<input name="repo" placeholder="用户名/hupan-museum-shows" /></label>
         <p id="github-gate-msg"></p>
         <button class="primary" type="submit">连接</button>
       </form>
     </div>
-    <script type="module" src="./src/main.js?v=light59"></script>
+    <script type="module" src="./src/main.js?v=light61"></script>
   </body>
 </html>

@@ -631,6 +631,8 @@ textarea {
   flex-direction: column;
   gap: 8px;
   margin-bottom: 16px;
+  -webkit-touch-callout: none;
+  user-select: none;
 }
 
 .show-menu {
@@ -808,6 +810,7 @@ canvas {
   display: block;
   width: 100%;
   height: 100%;
+  touch-action: none;
 }
 
 .hud {

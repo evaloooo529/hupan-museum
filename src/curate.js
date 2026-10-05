@@ -3,6 +3,7 @@ import { CEILING_HEIGHT, FLOOR_POLYGON, PANEL_BOTTOM, PANEL_HEIGHT, PANEL_THICKN
 
 const STORAGE_KEY = "school-art-museum-shows";
 const LEGACY_KEY = "school-art-museum-works";
+export let allowTouchPlace = () => true;
 
 let panels = [];
 let walls = [];
@@ -1383,7 +1384,7 @@ function renderWorks() {
   const listed = works.filter((work) => !work.poster);
   count.textContent = listed.length ? String(listed.length) : "";
   if (!listed.length) {
-    list.innerHTML = `<p class="empty">添加作品后，图片会跟着鼠标。在三维视图里点到展板或墙面上放下，可以跨过相邻的移动展板。跟着鼠标时，右键可以删除。</p>`;
+    list.innerHTML = `<p class="empty">添加作品后，图片会跟着指针。在三维视图里点到展板或墙面上放下，可以跨过相邻的移动展板。跟着指针时，右键或双指点按可以删除。</p>`;
     renderPosters();
     return;
   }
@@ -1616,18 +1617,49 @@ function bindShows() {
     form.reset();
     dialog.hidden = true;
   });
+  function openShowMenu(id, x, y) {
+    menu.hidden = false;
+    menu.dataset.show = id;
+    const pad = 8;
+    const width = menu.offsetWidth;
+    const height = menu.offsetHeight;
+    menu.style.left = `${Math.min(x, window.innerWidth - width - pad)}px`;
+    menu.style.top = `${Math.min(y, window.innerHeight - height - pad)}px`;
+  }
+
   document.getElementById("show-list").addEventListener("contextmenu", (event) => {
     const card = event.target.closest("[data-show]");
     if (!card) return;
     event.preventDefault();
-    menu.hidden = false;
-    menu.dataset.show = card.dataset.show;
-    const pad = 8;
-    const width = menu.offsetWidth;
-    const height = menu.offsetHeight;
-    menu.style.left = `${Math.min(event.clientX, window.innerWidth - width - pad)}px`;
-    menu.style.top = `${Math.min(event.clientY, window.innerHeight - height - pad)}px`;
+    openShowMenu(card.dataset.show, event.clientX, event.clientY);
   });
+  let showHold = null;
+  let suppressShowClick = false;
+  document.getElementById("show-list").addEventListener("pointerdown", (event) => {
+    if (event.pointerType === "mouse") return;
+    const card = event.target.closest("[data-show]");
+    if (!card) return;
+    const start = { x: event.clientX, y: event.clientY, id: card.dataset.show };
+    showHold = start;
+    start.timer = window.setTimeout(() => {
+      if (showHold !== start) return;
+      suppressShowClick = true;
+      openShowMenu(start.id, start.x, start.y);
+      showHold = null;
+    }, 520);
+  });
+  function clearShowHold(event) {
+    if (!showHold) return;
+    if (event && Math.hypot(event.clientX - showHold.x, event.clientY - showHold.y) <= 10 && event.type === "pointermove") return;
+    window.clearTimeout(showHold.timer);
+    showHold = null;
+  }
+  document.getElementById("show-list").addEventListener("pointermove", (event) => {
+    if (!showHold) return;
+    if (Math.hypot(event.clientX - showHold.x, event.clientY - showHold.y) > 10) clearShowHold(event);
+  });
+  document.getElementById("show-list").addEventListener("pointerup", () => clearShowHold());
+  document.getElementById("show-list").addEventListener("pointercancel", () => clearShowHold());
   menu.addEventListener("click", (event) => {
     const button = event.target.closest("[data-act]");
     const id = menu.dataset.show;
@@ -1641,6 +1673,12 @@ function bindShows() {
     closeMenu();
   });
   document.getElementById("show-list").addEventListener("click", (event) => {
+    if (suppressShowClick) {
+      suppressShowClick = false;
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
     const button = event.target.closest("[data-act]");
     if (!button) return;
     const card = button.closest("[data-show]");
@@ -1931,36 +1969,64 @@ function bindWorks() {
     if (cursor) cursor.hidden = false;
   });
 let decorSpin = null;
+const canvasFingers = new Set();
+let blockTouchPlace = false;
+
+function watchCanvasFinger(event, down) {
+  if (event.pointerType !== "touch") return;
+  const canvas = document.querySelector("#viewport canvas");
+  if (!canvas) return;
+  if (down) {
+    if (event.target !== canvas && !event.composedPath().includes(canvas)) return;
+    canvasFingers.add(event.pointerId);
+    return;
+  }
+  canvasFingers.delete(event.pointerId);
+}
+
+allowTouchPlace = () => {
+  if (!blockTouchPlace) return true;
+  if (canvasFingers.size === 0) blockTouchPlace = false;
+  return false;
+};
 
 document.addEventListener("pointerdown", (event) => {
-  if (event.button !== 2) return;
+  watchCanvasFinger(event, true);
+  const touchRight = event.pointerType === "touch" && event.button === 0 && canvasFingers.size >= 2;
+  if (event.button !== 2 && !touchRight) return;
   if (carrying) {
+    if (touchRight) blockTouchPlace = true;
     event.preventDefault();
     event.stopPropagation();
     discardCarriedArtwork();
     return;
   }
   if (decorCarry) {
+    if (touchRight) blockTouchPlace = true;
     event.preventDefault();
     event.stopPropagation();
     decorSpin = {
       x: event.clientX,
       rotationY: decorCarry.rotationY || 0,
       moved: false,
+      pointerId: event.pointerId,
     };
     return;
   }
   if (!installCarry) return;
+  if (touchRight) blockTouchPlace = true;
   event.preventDefault();
   event.stopPropagation();
   installSpin = {
     x: event.clientX,
     rotationY: installCarry.rotationY || 0,
     moved: false,
+    pointerId: event.pointerId,
   };
 }, true);
 document.addEventListener("pointermove", (event) => {
   if (decorSpin && decorCarry) {
+    if (event.pointerType === "touch" && event.pointerId !== decorSpin.pointerId) return;
     const dx = event.clientX - decorSpin.x;
     if (!decorSpin.moved && Math.abs(dx) < 4) return;
     decorSpin.moved = true;
@@ -1970,6 +2036,7 @@ document.addEventListener("pointermove", (event) => {
     return;
   }
   if (!installSpin || !installCarry) return;
+  if (event.pointerType === "touch" && event.pointerId !== installSpin.pointerId) return;
   const dx = event.clientX - installSpin.x;
   if (!installSpin.moved && Math.abs(dx) < 4) return;
   installSpin.moved = true;
@@ -1978,8 +2045,11 @@ document.addEventListener("pointermove", (event) => {
   if (group) group.rotation.y = installCarry.rotationY;
 }, true);
 document.addEventListener("pointerup", (event) => {
-  if (event.button !== 2) return;
-  if (decorSpin) {
+  watchCanvasFinger(event, false);
+  const endsDecor = decorSpin && (event.button === 2 || event.pointerId === decorSpin.pointerId);
+  const endsInstall = installSpin && (event.button === 2 || event.pointerId === installSpin.pointerId);
+  if (!endsDecor && !endsInstall) return;
+  if (endsDecor) {
     const spin = decorSpin;
     decorSpin = null;
     if (!spin.moved) discardCarriedDecoration();
@@ -1990,6 +2060,11 @@ document.addEventListener("pointerup", (event) => {
   installSpin = null;
   if (!spin.moved) discardCarriedInstallation();
 }, true);
+document.addEventListener("pointercancel", (event) => {
+  watchCanvasFinger(event, false);
+  if (decorSpin) decorSpin = null;
+  if (installSpin) installSpin = null;
+});
   document.addEventListener("contextmenu", (event) => {
     if (carrying || decorCarry || installCarry) event.preventDefault();
   });
@@ -2544,7 +2619,7 @@ function renderDecors() {
   if (!list || !count) return;
   count.textContent = decors.length ? String(decors.length) : "";
   if (!decors.length) {
-    list.innerHTML = `<p class="empty">添加装饰后，它会跟着鼠标。在地面上点击放下。跟着鼠标时，右键拖动可绕自身转一圈，右键点击可删除。放下后可拖动改位置，拖透明圆点改大小，右键拖动绕自身旋转。</p>`;
+    list.innerHTML = `<p class="empty">添加装饰后，它会跟着指针。在地面上点击放下。跟着指针时，右键或双指拖动可转向，右键或双指点按可删除。放下后可拖动改位置，拖透明圆点改大小，右键或双指拖动转向。</p>`;
     return;
   }
   list.innerHTML = decors
@@ -2554,7 +2629,7 @@ function renderDecors() {
       const held = decorCarry?.id === item.id;
       const placed = Number.isFinite(item.x);
       const scale = decorScaleOf(item);
-      const status = held ? "在鼠标上，点到地面放下" : placed ? "拖动改位置，拖透明圆点改大小，右键转向" : "尚未放置";
+      const status = held ? "在指针上，点到地面放下" : placed ? "拖动改位置，拖透明圆点改大小，右键或双指转向" : "尚未放置";
       return `<article class="work-card" data-decor="${item.id}">
         <span class="ph">${escapeHtml(name)}</span>
         <div class="work-body">
@@ -3078,7 +3153,7 @@ function renderInstalls() {
   if (!list || !count) return;
   count.textContent = installs.length ? String(installs.length) : "";
   if (!installs.length) {
-    list.innerHTML = `<p class="empty">导入 STL 后，装置会跟着鼠标。在地面上点击放下。跟着鼠标时，右键拖动可绕自身转一圈，右键点击可删除。放下后可拖动改位置，拖透明圆点改大小，右键拖动绕自身旋转。</p>`;
+    list.innerHTML = `<p class="empty">导入 STL 后，装置会跟着指针。在地面上点击放下。跟着指针时，右键或双指拖动可转向，右键或双指点按可删除。放下后可拖动改位置，拖透明圆点改大小，右键或双指拖动转向。</p>`;
     return;
   }
   list.innerHTML = installs
@@ -3086,7 +3161,7 @@ function renderInstalls() {
       const held = installCarry?.id === item.id;
       const placed = Number.isFinite(item.x);
       const scale = installScaleOf(item);
-      const status = held ? "在鼠标上，点到地面放下" : placed ? "拖动改位置，拖透明圆点改大小，右键转向" : "尚未放置";
+      const status = held ? "在指针上，点到地面放下" : placed ? "拖动改位置，拖透明圆点改大小，右键或双指转向" : "尚未放置";
       const byline = [item.artist, item.year].filter(Boolean).join(" · ");
       return `<article class="work-card" data-install="${item.id}">
         <span class="ph">${escapeHtml(item.title || "装置")}</span>

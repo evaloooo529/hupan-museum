@@ -24,7 +24,7 @@ import {
   WALL3_TRACK,
   WALLS,
 } from "./geometry.js?v=light27";
-import { initShell, noteLayoutChanged, artworkFromHit, carryingArtwork, previewCarry, placeCarry, beginArtworkMove, moveArtworkMove, endArtworkMove, carryingDecoration, previewDecor, placeDecor, decorationTargets, decorationFromHit, beginDecorMove, moveDecor, beginDecorScale, scaleDecorMove, endDecorGesture, carryingInstallation, previewInstall, placeInstall, installationTargets, installationFromHit, beginInstallMove, moveInstall, beginInstallScale, scaleInstallMove, endInstallGesture, spotlightEditing, onSpotlightMode, bindSpotLayout, saveSpotPose, setViewOnly } from "./curate.js?v=light26";
+import { initShell, noteLayoutChanged, artworkFromHit, carryingArtwork, previewCarry, placeCarry, beginArtworkMove, moveArtworkMove, endArtworkMove, carryingDecoration, previewDecor, placeDecor, decorationTargets, decorationFromHit, beginDecorMove, moveDecor, beginDecorScale, scaleDecorMove, endDecorGesture, carryingInstallation, previewInstall, placeInstall, installationTargets, installationFromHit, beginInstallMove, moveInstall, beginInstallScale, scaleInstallMove, endInstallGesture, spotlightEditing, onSpotlightMode, bindSpotLayout, saveSpotPose, setViewOnly, allowTouchPlace } from "./curate.js?v=light28";
 
 const viewport = document.querySelector("#viewport");
 const viewTag = document.querySelector("#view-tag");
@@ -1210,6 +1210,7 @@ let fpYaw = 0;
 let fpPitch = 0;
 let fpLook = null;
 let fpClick = null;
+let fpPinch = null;
 let fpSpotsOn = false;
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -1364,7 +1365,7 @@ function fitFp() {
   setViewOnly(true);
   placeOverhead();
   controls.enabled = false;
-  viewTag.textContent = "第一人称 · 左键点击地面站进去";
+  viewTag.textContent = fpPickerHint();
   wallTagGroup.visible = true;
   dimGroup.visible = document.getElementById("tog-dims").checked;
   compass.hidden = false;
@@ -1506,6 +1507,13 @@ let scalingInstall = false;
 let rotatingInstall = null;
 let movingSpot = null;
 let rotatingSpot = null;
+let gestureDecor = null;
+let gestureInstall = null;
+let gestureSpot = null;
+let gesturePointer = null;
+const canvasTouches = new Map();
+let touchRotateLock = false;
+let sawTouch = false;
 const ceilingPoint = new THREE.Vector3();
 const ceilingPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -(CEILING_HEIGHT - 0.06));
 let dragOffsetX = 0;
@@ -1560,7 +1568,7 @@ function standAt(x, z) {
   document.querySelector(".scale").hidden = true;
   controls.enabled = false;
   applyFpLook();
-  viewTag.textContent = "第一人称 · 左键换位置，右键环顾，滚轮调视野";
+  viewTag.textContent = fpStandHint();
   renderer.domElement.style.cursor = "crosshair";
   setCeilingForPerson(true);
   syncFpSpots();
@@ -1626,7 +1634,80 @@ function panelNearPoint(point, maxDist) {
   return best;
 }
 
+function touchUi() {
+  return sawTouch || window.matchMedia("(pointer: coarse)").matches;
+}
+
+function fpPickerHint() {
+  return touchUi() ? "第一人称 · 点按地面站进去" : "第一人称 · 左键点击地面站进去";
+}
+
+function fpStandHint() {
+  return touchUi() ? "第一人称 · 点按换位置，单指环顾，双指调视野" : "第一人称 · 左键换位置，右键环顾，滚轮调视野";
+}
+
+function noteTouch(event) {
+  if (event.pointerType !== "touch") return;
+  const first = !sawTouch;
+  sawTouch = true;
+  canvasTouches.set(event.pointerId, { x: event.clientX, y: event.clientY });
+  if (canvasTouches.size >= 2) touchRotateLock = true;
+  if (first && mode === "fp") viewTag.textContent = fpStanding ? fpStandHint() : fpPickerHint();
+}
+
+function touchSpan() {
+  const pts = [...canvasTouches.values()];
+  if (pts.length < 2) return 0;
+  return Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+}
+
+function rightDrag(event) {
+  return event.button === 2 || event.altKey || (event.pointerType === "touch" && canvasTouches.size >= 2);
+}
+
+function promoteTouchRotate() {
+  const primary = canvasTouches.values().next().value;
+  if (dragging) {
+    const point = pointOnFloor();
+    if (!point) return false;
+    rotating = dragging;
+    dragging = null;
+    rotateStart = rotating.rotation.y;
+    pointerStart = floorAngle(rotating, point);
+    renderer.domElement.style.cursor = "crosshair";
+    return true;
+  }
+  if (movingDecor && gestureDecor && !scalingDecor) {
+    movingDecor = false;
+    rotatingDecor = gestureDecor;
+    rotateStart = gestureDecor.rotation.y;
+    rotateClientX = primary.x;
+    renderer.domElement.style.cursor = "crosshair";
+    return true;
+  }
+  if (movingInstall && gestureInstall && !scalingInstall) {
+    movingInstall = false;
+    rotatingInstall = gestureInstall;
+    rotateStart = gestureInstall.rotation.y;
+    rotateClientX = primary.x;
+    renderer.domElement.style.cursor = "crosshair";
+    return true;
+  }
+  if (movingSpot && gestureSpot) {
+    rotatingSpot = gestureSpot;
+    movingSpot = null;
+    rotateStart = gestureSpot.rotation.y;
+    rotatePitchStart = gestureSpot.userData.pivot.rotation.x;
+    rotateClientX = primary.x;
+    rotateClientY = primary.y;
+    renderer.domElement.style.cursor = "crosshair";
+    return true;
+  }
+  return false;
+}
+
 function takePointer(event) {
+  gesturePointer = event.pointerId;
   controls.enabled = false;
   try { renderer.domElement.setPointerCapture(event.pointerId); } catch (err) { /* pointer already gone */ }
   event.preventDefault();
@@ -1701,11 +1782,31 @@ renderer.domElement.addEventListener("wheel", (event) => {
 }, { passive: false });
 
 renderer.domElement.addEventListener("pointerdown", (event) => {
+  noteTouch(event);
   if (mode === "fp") {
+    if (event.pointerType === "touch" && fpStanding && canvasTouches.size >= 2) {
+      fpLook = null;
+      fpClick = null;
+      fpPinch = { span: touchSpan(), fov: fpFov };
+      controls.enabled = false;
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
     if (event.button === 2 && fpStanding) {
       fpLook = { x: event.clientX, y: event.clientY, yaw: fpYaw, pitch: fpPitch };
+      gesturePointer = event.pointerId;
       controls.enabled = false;
       renderer.domElement.style.cursor = "grabbing";
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+    if (event.pointerType === "touch" && fpStanding && event.button === 0) {
+      fpLook = { x: event.clientX, y: event.clientY, yaw: fpYaw, pitch: fpPitch };
+      fpClick = { x: event.clientX, y: event.clientY };
+      gesturePointer = event.pointerId;
+      controls.enabled = false;
       event.preventDefault();
       event.stopPropagation();
       return;
@@ -1713,8 +1814,14 @@ renderer.domElement.addEventListener("pointerdown", (event) => {
     if (event.button !== 0) return;
     setPointer(event);
     fpClick = { x: event.clientX, y: event.clientY };
+    gesturePointer = event.pointerId;
     controls.enabled = false;
     renderer.domElement.style.cursor = "crosshair";
+    event.preventDefault();
+    event.stopPropagation();
+    return;
+  }
+  if (event.pointerType === "touch" && canvasTouches.size >= 2 && promoteTouchRotate()) {
     event.preventDefault();
     event.stopPropagation();
     return;
@@ -1726,7 +1833,7 @@ renderer.domElement.addEventListener("pointerdown", (event) => {
   if (spotlightEditing()) {
     const spot = spotFromHit(raycaster.intersectObjects(spotFixtures, true));
     const point = pointOnCeiling();
-    if (spot && (event.button === 2 || event.altKey)) {
+    if (spot && rightDrag(event)) {
       rotatingSpot = spot;
       rotateStart = spot.rotation.y;
       rotatePitchStart = spot.userData.pivot.rotation.x;
@@ -1738,30 +1845,43 @@ renderer.domElement.addEventListener("pointerdown", (event) => {
     }
     if (spot && point && event.button === 0) {
       movingSpot = spot;
+      gestureSpot = spot;
       renderer.domElement.style.cursor = "grabbing";
       takePointer(event);
       return;
     }
     return;
   }
-  if (event.button === 0 && carryingArtwork()) {
+  if (event.button === 0 && !rightDrag(event) && carryingArtwork()) {
     previewCarry(raycaster.ray, event.clientX, event.clientY);
+    if (event.pointerType === "touch") {
+      takePointer(event);
+      return;
+    }
     if (placeCarry()) {
       event.preventDefault();
       event.stopPropagation();
     }
     return;
   }
-  if (event.button === 0 && carryingDecoration()) {
+  if (event.button === 0 && !rightDrag(event) && carryingDecoration()) {
     previewDecor(pointOnFloor(), event.clientX, event.clientY);
+    if (event.pointerType === "touch") {
+      takePointer(event);
+      return;
+    }
     if (placeDecor()) {
       event.preventDefault();
       event.stopPropagation();
     }
     return;
   }
-  if (event.button === 0 && carryingInstallation()) {
+  if (event.button === 0 && !rightDrag(event) && carryingInstallation()) {
     previewInstall(pointOnFloor(), event.clientX, event.clientY);
+    if (event.pointerType === "touch") {
+      takePointer(event);
+      return;
+    }
     if (placeInstall()) {
       event.preventDefault();
       event.stopPropagation();
@@ -1781,14 +1901,14 @@ renderer.domElement.addEventListener("pointerdown", (event) => {
     const point = pointOnFloor();
     const beginScale = floorKind === "install" ? beginInstallScale : beginDecorScale;
     const beginMove = floorKind === "install" ? beginInstallMove : beginDecorMove;
-    if (event.button === 0 && point && (floorHit.handle || event.shiftKey) && beginScale(floorHit.group, point)) {
+    if (event.button === 0 && !rightDrag(event) && point && (floorHit.handle || event.shiftKey) && beginScale(floorHit.group, point)) {
       if (floorKind === "install") scalingInstall = true;
       else scalingDecor = true;
       renderer.domElement.style.cursor = "nesw-resize";
       takePointer(event);
       return;
     }
-    if (event.button === 2 || event.altKey) {
+    if (rightDrag(event)) {
       if (point && beginMove(floorHit.group)) {
         if (floorKind === "install") rotatingInstall = floorHit.group;
         else rotatingDecor = floorHit.group;
@@ -1799,9 +1919,14 @@ renderer.domElement.addEventListener("pointerdown", (event) => {
       }
       return;
     }
-    if (event.button === 0 && beginMove(floorHit.group)) {
-      if (floorKind === "install") movingInstall = true;
-      else movingDecor = true;
+    if (event.button === 0 && !rightDrag(event) && beginMove(floorHit.group)) {
+      if (floorKind === "install") {
+        movingInstall = true;
+        gestureInstall = floorHit.group;
+      } else {
+        movingDecor = true;
+        gestureDecor = floorHit.group;
+      }
       dragOffsetX = floorHit.group.position.x - (point ? point.x : floorHit.group.position.x);
       dragOffsetZ = floorHit.group.position.z - (point ? point.z : floorHit.group.position.z);
       renderer.domElement.style.cursor = "grabbing";
@@ -1809,7 +1934,7 @@ renderer.domElement.addEventListener("pointerdown", (event) => {
       return;
     }
   }
-  if (artwork && !artwork.userData.fixed && event.button === 0 && !event.altKey && dist.art < dist.panel && dist.art <= dist.decor && dist.art <= installDist) {
+  if (artwork && !artwork.userData.fixed && event.button === 0 && !rightDrag(event) && dist.art < dist.panel && dist.art <= dist.decor && dist.art <= installDist) {
     if (beginArtworkMove(artwork)) {
       movingArt = true;
       renderer.domElement.style.cursor = "grabbing";
@@ -1822,7 +1947,7 @@ renderer.domElement.addEventListener("pointerdown", (event) => {
   if (!panel && event.button === 0) panel = panelNearPoint(point, 0.9);
   if (!panel || !point) return;
   angleSnapHeld = false;
-  if (event.button === 2 || event.altKey) {
+  if (rightDrag(event)) {
     rotating = panel;
     rotateStart = panel.rotation.y;
     pointerStart = floorAngle(panel, point);
@@ -1837,6 +1962,18 @@ renderer.domElement.addEventListener("pointerdown", (event) => {
 }, true);
 
 renderer.domElement.addEventListener("pointermove", (event) => {
+  if (event.pointerType === "touch" && canvasTouches.has(event.pointerId)) {
+    canvasTouches.set(event.pointerId, { x: event.clientX, y: event.clientY });
+  }
+  if (mode === "fp" && fpPinch && canvasTouches.size >= 2) {
+    const span = touchSpan();
+    if (span > 0 && fpPinch.span > 0) {
+      fpFov = THREE.MathUtils.clamp(fpPinch.fov / (span / fpPinch.span), 40, 90);
+      applyFpLook();
+    }
+    return;
+  }
+  if (gesturePointer != null && event.pointerId !== gesturePointer) return;
   if (mode === "fp") {
     if (!fpLook || !fpStanding) return;
     const dx = event.clientX - fpLook.x;
@@ -1973,13 +2110,15 @@ function endDrag(event) {
     const click = fpClick;
     fpClick = null;
     fpLook = null;
-    if (event?.button === 0 && click && Math.hypot(event.clientX - click.x, event.clientY - click.y) < 6) {
+    const limit = event?.pointerType === "touch" ? 24 : 6;
+    if (event?.button === 0 && click && Math.hypot(event.clientX - click.x, event.clientY - click.y) < limit) {
       setPointer(event);
       const spot = floorStandPoint();
       if (spot) standAt(spot.x, spot.z);
     }
     renderer.domElement.style.cursor = "crosshair";
     controls.enabled = false;
+    gesturePointer = null;
     return;
   }
   const movedArt = movingArt;
@@ -1995,6 +2134,10 @@ function endDrag(event) {
   rotatingInstall = null;
   movingSpot = null;
   rotatingSpot = null;
+  gestureDecor = null;
+  gestureInstall = null;
+  gestureSpot = null;
+  gesturePointer = null;
   if (spotGesture) {
     saveSpotPose(
       spotGesture.userData.spotIndex,
@@ -2019,8 +2162,49 @@ function endDrag(event) {
   if (moved) noteLayoutChanged();
 }
 
-renderer.domElement.addEventListener("pointerup", endDrag);
-renderer.domElement.addEventListener("pointercancel", endDrag);
+function placeTouchedCarry(event) {
+  if (!allowTouchPlace()) return;
+  setPointer(event);
+  gallery.updateMatrixWorld(true);
+  raycaster.setFromCamera(pointer, activeCamera());
+  if (carryingArtwork()) {
+    previewCarry(raycaster.ray, event.clientX, event.clientY);
+    placeCarry();
+    return;
+  }
+  const floor = pointOnFloor();
+  if (carryingDecoration()) {
+    previewDecor(floor, event.clientX, event.clientY);
+    placeDecor();
+    return;
+  }
+  if (carryingInstallation()) {
+    previewInstall(floor, event.clientX, event.clientY);
+    placeInstall();
+  }
+}
+
+function onCanvasPointerDone(event) {
+  const touch = event?.pointerType === "touch";
+  if (touch) canvasTouches.delete(event.pointerId);
+  const extraFinger = touch && gesturePointer != null && event.pointerId !== gesturePointer && canvasTouches.has(gesturePointer);
+  if (extraFinger) {
+    if (canvasTouches.size < 2) fpPinch = null;
+    controls.enabled = false;
+    return;
+  }
+  const blocked = touchRotateLock;
+  if (canvasTouches.size === 0) {
+    touchRotateLock = false;
+    fpPinch = null;
+  }
+  if (event.type === "pointerup" && touch && canvasTouches.size === 0 && !blocked && mode !== "fp") placeTouchedCarry(event);
+  endDrag(event);
+  if (touch && canvasTouches.size > 0) controls.enabled = false;
+}
+
+renderer.domElement.addEventListener("pointerup", onCanvasPointerDone);
+renderer.domElement.addEventListener("pointercancel", onCanvasPointerDone);
 
 const compassRose = document.querySelector("#rose");
 const southVector = new THREE.Vector3();
