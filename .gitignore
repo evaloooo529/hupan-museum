@@ -3,3 +3,7 @@ node_modules/
 .env.*
 __pycache__/
 *.pyc
+data/shows.json
+data/password.txt
+data/secret.txt
+.tools/

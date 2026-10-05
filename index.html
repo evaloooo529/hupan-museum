@@ -3,8 +3,9 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="gallery-data-repo" content="evaloooo529/hupan-museum-shows" />
     <title>湖畔美术馆</title>
-    <link rel="stylesheet" href="./src/style.css?v=light14" />
+    <link rel="stylesheet" href="./src/style.css?v=light41" />
     <script type="importmap">
       {
         "imports": {
@@ -44,9 +45,6 @@
               <div><span>北向入口</span><strong>约 1.48 m</strong></div>
             </div>
             <div class="controls">
-              <button id="btn-top" class="active" type="button" data-view="top">俯视平面</button>
-              <button id="btn-3d" type="button" data-view="3d">三维透视</button>
-              <button id="btn-fp" type="button" data-view="fp">第一人称</button>
               <label class="chk">
                 <input id="tog-plan" type="checkbox" />
                 叠加原平面图核对比例
@@ -67,8 +65,6 @@
               <div><i class="panel"></i>移动展板</div>
               <div><i class="track"></i>天花滑轨</div>
               <div><i class="ltrack"></i>灯轨与射灯</div>
-              <div><i class="seat"></i>台阶</div>
-              <div><i class="screen"></i>显示屏</div>
             </div>
             <p class="note">
               比例依据：平面图中黄色轨道网格接近正方形，结合展板宽度 1.03
@@ -77,15 +73,13 @@
             </p>
           </section>
           <section id="section-curate" hidden>
-            <h1>虚拟策展</h1>
-            <form id="show-form" class="work-form">
-              <label>展览名称<input name="name" required placeholder="例如：春季展" /></label>
-              <button class="primary" type="submit">新建展览</button>
-            </form>
+            <h1 id="curate-title">虚拟策展</h1>
+            <button type="button" class="tool" id="open-show-dialog">新建展览</button>
+            <h2 id="show-list-title" class="show-list-title">展览列表</h2>
             <p id="curate-msg" class="form-msg"></p>
             <div id="show-list" class="show-list"></div>
             <div id="show-studio" hidden>
-              <p id="show-now" class="show-now"></p>
+              <p id="show-now" class="show-now" hidden></p>
               <div class="controls">
                 <button type="button" data-view="top">俯视平面</button>
                 <button type="button" data-view="3d">三维透视</button>
@@ -110,18 +104,24 @@
                 </div>
               </div>
               <button type="button" class="tool" id="open-work-dialog">添加作品</button>
-              <details class="fold" id="work-fold" open>
+              <details class="fold" id="work-fold">
                 <summary>作品列表 <span id="work-count"></span></summary>
                 <div id="work-list" class="work-list"></div>
               </details>
+              <button type="button" class="tool" id="open-install-dialog">添加装置</button>
+              <details class="fold" id="install-fold">
+                <summary>装置列表 <span id="install-count"></span></summary>
+                <div id="install-list" class="work-list"></div>
+              </details>
               <button type="button" class="tool" id="open-decor-dialog">添加装饰</button>
-              <details class="fold" id="decor-fold" open>
+              <details class="fold" id="decor-fold">
                 <summary>装饰列表 <span id="decor-count"></span></summary>
                 <div id="decor-list" class="work-list"></div>
               </details>
             </div>
           </section>
         </div>
+        <button type="button" id="github-logout" hidden>断开 GitHub</button>
       </aside>
       <div id="viewport">
         <div id="compass" aria-label="指南针，上方为南">
@@ -139,18 +139,70 @@
             <div class="scale-bar" id="scale-bar"></div>
           </div>
           <div class="view-tag" id="view-tag">俯视平面</div>
+          <button type="button" id="fp-spots" class="fp-spots" hidden aria-pressed="false">射灯 关</button>
         </div>
+        <button type="button" id="shot" class="shot" hidden aria-label="拍摄当前画面">
+          <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+            <path d="M9 7.2 10.2 5h3.6L15 7.2h2.2A1.8 1.8 0 0 1 19 9v8a1.8 1.8 0 0 1-1.8 1.8H6.8A1.8 1.8 0 0 1 5 17V9a1.8 1.8 0 0 1 1.8-1.8H9Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" />
+            <circle cx="12" cy="12.2" r="3.1" fill="none" stroke="currentColor" stroke-width="1.6" />
+          </svg>
+        </button>
         <div id="art-cursor" hidden></div>
       </div>
     </div>
+    <div id="show-menu" class="show-menu" hidden>
+      <button type="button" data-act="rename">重命名</button>
+      <button type="button" data-act="delete-show">删除</button>
+    </div>
+    <div id="show-dialog" class="modal" hidden>
+      <form id="show-form" class="modal-card work-form">
+        <h2>新建展览</h2>
+        <label>展览名称<input name="name" required placeholder="例如：春季展" /></label>
+        <div class="modal-actions">
+          <button type="button" data-dialog="cancel">取消</button>
+          <button class="primary" type="submit">确认</button>
+        </div>
+      </form>
+    </div>
     <div id="work-dialog" class="modal" hidden>
       <form id="work-form" class="modal-card work-form">
-        <h2>添加作品</h2>
-        <label>作品名称<input name="title" required placeholder="例如：春水" /></label>
+        <div id="work-step-info">
+          <h2>添加作品</h2>
+          <label>作品名称<input name="title" required placeholder="例如：春水" /></label>
+          <label>作者<input name="artist" placeholder="作者姓名" /></label>
+          <label>年份<input name="year" placeholder="2026" /></label>
+          <label>说明<textarea name="note" rows="2" placeholder="材质、尺寸或策展备注"></textarea></label>
+          <label>图片<input name="image" type="file" accept="image/*" /></label>
+          <p id="work-image-note" class="form-msg" hidden>图片已读入，下一步选择画框。</p>
+          <div class="modal-actions">
+            <button type="button" data-dialog="cancel">取消</button>
+            <button class="primary" type="submit">确认</button>
+          </div>
+        </div>
+        <div id="work-step-frame" hidden>
+          <h2>添加画框</h2>
+          <p class="form-msg">选一种画框。无框就是画面直接上墙。</p>
+          <div id="frame-stage" class="frame-stage" data-frame="none">
+            <div class="frame-mat"><img id="frame-preview-img" alt="" /></div>
+          </div>
+          <div id="frame-picks" class="frame-grid"></div>
+          <div class="modal-actions">
+            <button type="button" data-frame="back">上一步</button>
+            <button class="primary" type="button" id="frame-confirm">确认</button>
+          </div>
+        </div>
+      </form>
+    </div>
+    <div id="install-dialog" class="modal" hidden>
+      <form id="install-form" class="modal-card work-form">
+        <h2>添加装置</h2>
+        <p class="form-msg">导入 STL 后，装置会跟着鼠标。在地面上点击放下。跟着鼠标时，右键拖动可绕自身转一圈，右键点击可删除。放下之后可以拖动改位置，拖透明圆点改大小，右键拖动绕自身旋转。</p>
+        <label>装置名称<input name="title" required placeholder="例如：栖息" /></label>
         <label>作者<input name="artist" placeholder="作者姓名" /></label>
         <label>年份<input name="year" placeholder="2026" /></label>
         <label>说明<textarea name="note" rows="2" placeholder="材质、尺寸或策展备注"></textarea></label>
-        <label>图片<input name="image" type="file" accept="image/*" /></label>
+        <label>STL 文件<input name="stl" type="file" accept=".stl,model/stl" required /></label>
+        <p id="install-file-note" class="form-msg" hidden></p>
         <div class="modal-actions">
           <button type="button" data-dialog="cancel">取消</button>
           <button class="primary" type="submit">确认</button>
@@ -167,6 +219,16 @@
         </div>
       </div>
     </div>
-    <script type="module" src="./src/main.js?v=light14"></script>
+    <div id="github-gate" class="github-gate" hidden>
+      <form id="github-form">
+        <h1>连接 GitHub</h1>
+        <p>粘贴一个可以读写私有仓库的 GitHub 令牌。它只保存在这台设备的浏览器里，用来在不同设备之间同步同一份策展。</p>
+        <label>令牌<input name="token" type="password" autocomplete="off" required placeholder="github_pat_…" /></label>
+        <label id="github-repo-label">仓库<input name="repo" placeholder="用户名/hupan-museum-shows" /></label>
+        <p id="github-gate-msg"></p>
+        <button class="primary" type="submit">连接</button>
+      </form>
+    </div>
+    <script type="module" src="./src/main.js?v=light59"></script>
   </body>
 </html>

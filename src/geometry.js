@@ -70,21 +70,22 @@ export const WALLS = [
   { id: 5, x1: 13.273, z1: 7.316, x2: 10.89, z2: 7.316, thickness: WALL_THIN, kind: "thin" },
   { id: 6, x1: 10.89, z1: 7.316, x2: 10.89, z2: 10.493, thickness: WALL_THIN, kind: "thin" },
   { id: 7, x1: 10.89, z1: 10.493, x2: 8.005, z2: 10.493, thickness: WALL_THIN, kind: "thin" },
-  // The thin northeast diagonal used to sit on the same line as wall 21. Wall 21 is the wall.
+  // Thin diagonal envelope. Wall 21 is the thicker mass on its inner face.
+  { id: 8, x1: 8.005, z1: 10.493, x2: 6.083, z2: 12.374, thickness: WALL_THIN, kind: "thin" },
   // North envelope, split by the entrance (~1.48 m)
   { id: 9, x1: 6.083, z1: 12.374, x2: 4.942, z2: 12.374, thickness: WALL_THIN, kind: "thin" },
   { id: 10, x1: 3.458, z1: 12.374, x2: 0.0, z2: 12.374, thickness: WALL_THIN, kind: "thin" },
   // West envelope
   { id: 11, x1: 0.0, z1: 12.374, x2: 0.0, z2: 0.0, thickness: WALL_THIN, kind: "thin" },
 
-  // South face lines up with wall 3. Thickness stays equal to the former length of wall 13.
+  // South face lines up with wall 3. North-south width is two thirds of wall 13's old length.
   {
     id: 12,
     x1: 8.005 - WALL_THIN / 2,
-    z1: 5.727 - WALL_THIN / 2 + (6.208 - 5.727) / 2,
+    z1: 5.727 - WALL_THIN / 2 + ((6.208 - 5.727) * 2) / 3 / 2,
     x2: 11.287 - WALL_THIN / 2,
-    z2: 5.727 - WALL_THIN / 2 + (6.208 - 5.727) / 2,
-    thickness: 6.208 - 5.727,
+    z2: 5.727 - WALL_THIN / 2 + ((6.208 - 5.727) * 2) / 3 / 2,
+    thickness: ((6.208 - 5.727) * 2) / 3,
     kind: "thin",
   },
   // Thin wall south of the central pier, meeting the stepped envelope
@@ -153,7 +154,7 @@ export const DIAGONAL_THICK = {
 export const OPENINGS = [
   { id: "entrance", x1: 3.458, z1: 12.374, x2: 4.942, z2: 12.374, width: 1.484 },
   { id: "north-wing-passage", x1: 11.287 - WALL_THIN / 2, z1: 5.727, x2: 12.959, z2: 5.727, width: 12.959 - (11.287 - WALL_THIN / 2) },
-  { id: "central-passage", x1: 8.005, z1: 5.727 - WALL_THIN / 2 + (6.208 - 5.727), x2: 8.005, z2: 7.859, width: 7.859 - (5.727 - WALL_THIN / 2 + (6.208 - 5.727)) },
+  { id: "central-passage", x1: 8.005, z1: 5.727 - WALL_THIN / 2 + ((6.208 - 5.727) * 2) / 3, x2: 8.005, z2: 7.859, width: 7.859 - (5.727 - WALL_THIN / 2 + ((6.208 - 5.727) * 2) / 3) },
 ];
 
 /** Pixel trace of the source plan, used to keep the model and the overlay in register. */
@@ -182,6 +183,44 @@ export const TRACKS = {
     { z: 6.48, x1: 0.627, x2: 7.838 },
   ],
 };
+
+/**
+ * Extra ceiling rail along wall 3. Same length as that wall, parallel to it,
+ * 0.5 m south of the inner face. Kept out of the light-track grid.
+ */
+const wall3 = WALLS.find((wall) => wall.id === 3);
+export const WALL3_TRACK = {
+  x1: Math.min(wall3.x1, wall3.x2),
+  x2: Math.max(wall3.x1, wall3.x2),
+  z: wall3.z1 - wall3.thickness / 2 - 0.5,
+};
+
+/**
+ * Extra white light tracks. Same length as the wall they serve, sitting against
+ * the lit face. Spots aim into the room so the heads are not inside the wall.
+ * Wall 19: east face. Wall 15: north face.
+ */
+const LIGHT_FACE_GAP = 0.03;
+const wall19 = THICK_BLOCKS.find((block) => block.id === 19);
+const wall15 = WALLS.find((wall) => wall.id === 15);
+export const EXTRA_LIGHT_TRACKS = [
+  {
+    x1: wall19.x + wall19.w + LIGHT_FACE_GAP,
+    z1: wall19.z,
+    x2: wall19.x + wall19.w + LIGHT_FACE_GAP,
+    z2: wall19.z + wall19.d,
+    aimX: 1,
+    aimZ: 0,
+  },
+  {
+    x1: Math.min(wall15.x1, wall15.x2),
+    z1: wall15.z1 + wall15.thickness / 2 + LIGHT_FACE_GAP,
+    x2: Math.max(wall15.x1, wall15.x2),
+    z2: wall15.z1 + wall15.thickness / 2 + LIGHT_FACE_GAP,
+    aimX: 0,
+    aimZ: 1,
+  },
+];
 
 export const ENTRANCE = {
   x1: 3.458,

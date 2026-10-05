@@ -73,15 +73,341 @@ function persistActive() {
   show.updatedAt = Date.now();
 }
 
+const GH_KEY = "school-art-museum-github";
+const GH_PATH = "data/shows.json";
+const GH_CONTENTS_LIMIT = 900000;
+
+function dataRepoName() {
+  const meta = document.querySelector('meta[name="gallery-data-repo"]')?.content?.trim() || "";
+  if (meta.includes("/")) return meta;
+  try {
+    const saved = JSON.parse(localStorage.getItem(GH_KEY) || "null");
+    if (saved?.repo?.includes("/")) return saved.repo;
+  } catch {
+    /* typed in the form */
+  }
+  return "";
+}
+
+function githubConfig() {
+  let saved = null;
+  try {
+    saved = JSON.parse(localStorage.getItem(GH_KEY) || "null");
+  } catch {
+    saved = null;
+  }
+  const [owner, repo] = dataRepoName().split("/");
+  if (!saved?.token || !owner || !repo) return null;
+  return { token: saved.token, owner, repo, branch: saved.branch || "main" };
+}
+
+function hostedOnGithub() {
+  return location.hostname.endsWith(".github.io");
+}
+
+function syncGithubLogout() {
+  const button = document.getElementById("github-logout");
+  if (button) button.hidden = !githubConfig();
+}
+
+function showGithubGate(message) {
+  const gate = document.getElementById("github-gate");
+  if (!gate) return;
+  const meta = document.querySelector('meta[name="gallery-data-repo"]')?.content?.trim() || "";
+  const repoLabel = document.getElementById("github-repo-label");
+  if (repoLabel) repoLabel.hidden = meta.includes("/");
+  const msg = document.getElementById("github-gate-msg");
+  if (msg) msg.textContent = message || "";
+  gate.hidden = false;
+}
+
+async function githubRequest(path, options = {}) {
+  const cfg = githubConfig();
+  if (!cfg) {
+    const err = new Error("auth");
+    throw err;
+  }
+  const res = await fetch(`https://api.github.com${path}`, {
+    ...options,
+    headers: {
+      Accept: "application/vnd.github+json",
+      Authorization: `Bearer ${cfg.token}`,
+      "X-GitHub-Api-Version": "2022-11-28",
+      ...(options.headers || {}),
+    },
+  });
+  const text = await res.text();
+  let body = null;
+  try {
+    body = text ? JSON.parse(text) : null;
+  } catch {
+    body = { message: text };
+  }
+  const message = body?.message || "";
+  if (res.status === 401 || (res.status === 403 && /credential|token|resource not accessible/i.test(message))) {
+    const err = new Error("auth");
+    err.status = res.status;
+    throw err;
+  }
+  return { res, body };
+}
+
+function decodeGithubContent(body) {
+  const binary = atob(String(body.content || "").replace(/\n/g, ""));
+  const bytes = Uint8Array.from(binary, (ch) => ch.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+}
+
+function parseArchive(text) {
+  const parsed = JSON.parse(text);
+  if (!parsed || !Array.isArray(parsed.shows)) return { shows: [], activeId: null };
+  return { shows: parsed.shows, activeId: parsed.activeId || null };
+}
+
+function utf8Base64(text) {
+  const bytes = new TextEncoder().encode(text);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(binary);
+}
+
+async function githubLoad() {
+  const cfg = githubConfig();
+  const { res, body } = await githubRequest(`/repos/${cfg.owner}/${cfg.repo}/contents/${GH_PATH}?ref=${encodeURIComponent(cfg.branch)}`);
+  if (res.status === 404) return { shows: [], activeId: null, sha: null, missing: true };
+  if (body?.content && body.encoding === "base64") {
+    return { ...parseArchive(decodeGithubContent(body)), sha: body.sha || null };
+  }
+  let sha = body?.sha || null;
+  if (!sha) {
+    const tree = await githubRequest(`/repos/${cfg.owner}/${cfg.repo}/git/trees/${encodeURIComponent(cfg.branch)}?recursive=1`);
+    sha = tree.body?.tree?.find((item) => item.path === GH_PATH)?.sha || null;
+  }
+  if (!sha) throw new Error(body?.message || "read");
+  const blob = await githubRequest(`/repos/${cfg.owner}/${cfg.repo}/git/blobs/${sha}`);
+  if (!blob.res.ok || blob.body?.encoding !== "base64") throw new Error(blob.body?.message || "blob");
+  return { ...parseArchive(decodeGithubContent(blob.body)), sha };
+}
+
+async function githubSaveBlob(cfg, text) {
+  const blob = await githubRequest(`/repos/${cfg.owner}/${cfg.repo}/git/blobs`, {
+    method: "POST",
+    body: JSON.stringify({ content: utf8Base64(text), encoding: "base64" }),
+  });
+  if (!blob.res.ok) throw new Error(blob.body?.message || "blob");
+  const ref = await githubRequest(`/repos/${cfg.owner}/${cfg.repo}/git/ref/heads/${cfg.branch}`);
+  if (!ref.res.ok) throw new Error(ref.body?.message || "ref");
+  const parent = ref.body.object.sha;
+  const commit = await githubRequest(`/repos/${cfg.owner}/${cfg.repo}/git/commits/${parent}`);
+  if (!commit.res.ok) throw new Error(commit.body?.message || "commit");
+  const tree = await githubRequest(`/repos/${cfg.owner}/${cfg.repo}/git/trees`, {
+    method: "POST",
+    body: JSON.stringify({
+      base_tree: commit.body.tree.sha,
+      tree: [{ path: GH_PATH, mode: "100644", type: "blob", sha: blob.body.sha }],
+    }),
+  });
+  if (!tree.res.ok) throw new Error(tree.body?.message || "tree");
+  const next = await githubRequest(`/repos/${cfg.owner}/${cfg.repo}/git/commits`, {
+    method: "POST",
+    body: JSON.stringify({ message: "更新策展存档", tree: tree.body.sha, parents: [parent] }),
+  });
+  if (!next.res.ok) throw new Error(next.body?.message || "commit");
+  const update = await githubRequest(`/repos/${cfg.owner}/${cfg.repo}/git/refs/heads/${cfg.branch}`, {
+    method: "PATCH",
+    body: JSON.stringify({ sha: next.body.sha }),
+  });
+  if (!update.res.ok) throw new Error(update.body?.message || "ref");
+}
+
+async function githubSave(payload) {
+  const cfg = githubConfig();
+  const text = JSON.stringify(payload);
+  const size = new TextEncoder().encode(text).length;
+  const current = await githubLoad().catch((err) => {
+    if (err.message === "auth") throw err;
+    return { sha: null };
+  });
+  if (size >= GH_CONTENTS_LIMIT) {
+    await githubSaveBlob(cfg, text);
+    return;
+  }
+  const put = await githubRequest(`/repos/${cfg.owner}/${cfg.repo}/contents/${GH_PATH}`, {
+    method: "PUT",
+    body: JSON.stringify({
+      message: "更新策展存档",
+      content: utf8Base64(text),
+      sha: current.sha || undefined,
+      branch: cfg.branch,
+    }),
+  });
+  if (put.res.status === 409) {
+    const again = await githubLoad();
+    const retry = await githubRequest(`/repos/${cfg.owner}/${cfg.repo}/contents/${GH_PATH}`, {
+      method: "PUT",
+      body: JSON.stringify({
+        message: "更新策展存档",
+        content: utf8Base64(text),
+        sha: again.sha,
+        branch: cfg.branch,
+      }),
+    });
+    if (!retry.res.ok) throw new Error(retry.body?.message || "save");
+    return;
+  }
+  if (!put.res.ok) {
+    if (size >= 700000) {
+      await githubSaveBlob(cfg, text);
+      return;
+    }
+    throw new Error(put.body?.message || "save");
+  }
+}
+
+function bindGithub() {
+  const form = document.getElementById("github-form");
+  const logout = document.getElementById("github-logout");
+  syncGithubLogout();
+  form?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const data = new FormData(form);
+    const token = String(data.get("token") || "").trim();
+    const meta = document.querySelector('meta[name="gallery-data-repo"]')?.content?.trim() || "";
+    const repo = (meta.includes("/") ? meta : String(data.get("repo") || "")).trim();
+    if (!token || !repo.includes("/")) {
+      showGithubGate("需要令牌，以及形如 用户名/hupan-museum-shows 的仓库名。");
+      return;
+    }
+    localStorage.setItem(GH_KEY, JSON.stringify({ token, repo, branch: "main" }));
+    try {
+      const remote = await githubLoad();
+      document.getElementById("github-gate").hidden = true;
+      syncGithubLogout();
+      if (remote.missing) {
+        const local = loadStore();
+        if (local.shows.length) {
+          applyStored({ ...local, upload: true });
+          return;
+        }
+      }
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify({ shows: remote.shows, activeId: remote.activeId }));
+      } catch {
+        /* the shared copy is still shown */
+      }
+      applyStored(remote);
+    } catch {
+      localStorage.removeItem(GH_KEY);
+      syncGithubLogout();
+      showGithubGate("这个令牌读不到策展仓库。请确认仓库名，以及令牌有读写权限。");
+    }
+  });
+  logout?.addEventListener("click", () => {
+    localStorage.removeItem(GH_KEY);
+    syncGithubLogout();
+    if (!hostedOnGithub()) return;
+    shows = [];
+    activeId = null;
+    works = [];
+    decors = [];
+    installs = [];
+    setStudio(false);
+    renderShows();
+    renderWorks();
+    renderDecors();
+    renderInstalls();
+    showGithubGate();
+  });
+}
+
 function saveStore() {
   persistActive();
+  const payload = { shows, activeId };
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ shows, activeId }));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
     localStorage.removeItem(LEGACY_KEY);
     setMessage("");
   } catch {
-    setMessage("展区内容太多或图片太大，这次没能保存在本机。");
+    setMessage("展区内容太多或图片太大，这次没能保存在本机浏览器。");
   }
+  if (githubConfig()) {
+    githubSave(payload).catch((err) => {
+      if (err.message === "auth") {
+        localStorage.removeItem(GH_KEY);
+        syncGithubLogout();
+        showGithubGate("令牌已失效，请重新连接。");
+        return;
+      }
+      setMessage("这次修改没能写进 GitHub，其他设备暂时看不到。");
+    });
+    return;
+  }
+  if (hostedOnGithub()) return;
+  fetch("/api/shows", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }).then((res) => {
+    if (res.status === 401) {
+      window.location.href = "/login";
+      return;
+    }
+    if (!res.ok) setMessage("展览没能写进共享存档，其他浏览器暂时看不到这次修改。");
+  }).catch(() => {
+    setMessage("展览没能写进共享存档，其他浏览器暂时看不到这次修改。");
+  });
+}
+
+async function loadSharedStore() {
+  const local = loadStore();
+  if (hostedOnGithub()) {
+    if (!githubConfig()) {
+      showGithubGate();
+      return { shows: [], activeId: null, hold: true };
+    }
+    try {
+      const remote = await githubLoad();
+      if (remote.missing && local.shows.length) return { ...local, upload: true };
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify({ shows: remote.shows, activeId: remote.activeId }));
+      } catch {
+        /* this browser can still show the shared copy */
+      }
+      return remote;
+    } catch (err) {
+      if (err.message === "auth") {
+        localStorage.removeItem(GH_KEY);
+        syncGithubLogout();
+      }
+      showGithubGate("令牌无法读取策展存档。请确认它可以读写这个私有仓库。");
+      return { shows: [], activeId: null, hold: true };
+    }
+  }
+  try {
+    const res = await fetch("/api/shows", { cache: "no-store" });
+    if (res.status === 401) {
+      window.location.href = "/login";
+      return local;
+    }
+    if (res.ok) {
+      const remote = await res.json();
+      if (remote && Array.isArray(remote.shows) && remote.shows.length) {
+        const stored = { shows: remote.shows, activeId: remote.activeId || null };
+        try {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(stored));
+        } catch {
+          /* this browser can still show the shared copy */
+        }
+        return stored;
+      }
+    }
+  } catch {
+    /* this browser keeps its own copy until the shared archive is reachable */
+  }
+  if (local.shows.length) return { ...local, upload: true };
+  return local;
 }
 
 export function noteLayoutChanged() {
@@ -102,6 +428,9 @@ function showSection(name) {
 function showHome() {
   document.getElementById("nav-home").hidden = false;
   document.getElementById("workspace").hidden = true;
+  document.getElementById("show-dialog").hidden = true;
+  document.getElementById("show-menu").hidden = true;
+  document.getElementById("install-dialog").hidden = true;
 }
 
 function goBack() {
@@ -320,6 +649,14 @@ let decorSnapshot = null;
 let decorPending = null;
 let decorMove = null;
 let decorScaleDrag = null;
+let installRoot = null;
+let installs = [];
+let installCarry = null;
+let installSnapshot = null;
+let installPending = null;
+let installMove = null;
+let installScaleDrag = null;
+let installSpin = null;
 
 function holder() {
   if (!loose) {
@@ -360,10 +697,8 @@ function applyArtworkWidth(work, width, persist) {
   work.width = next;
   const mesh = artworkMesh(work);
   if (mesh) {
-    mesh.geometry.dispose();
-    mesh.geometry = new THREE.PlaneGeometry(next, next / aspect);
-    mesh.userData.width = next;
     if (panels.includes(mesh.parent) || walls.includes(mesh.parent)) writePose(mesh, work);
+    else layoutArtwork(mesh, work);
   }
   syncSizeControl(work);
   if (persist) saveStore();
@@ -411,12 +746,7 @@ function writePose(mesh, work) {
   work.offsetY = clamped.offsetY;
   work.offsetZ = clamped.offsetZ;
   work.width = clamped.width;
-  const aspect = work.aspect || 0.8;
-  const geom = mesh.geometry.parameters;
-  if (!geom || Math.abs((geom.width || 0) - work.width) > 0.001) {
-    mesh.geometry.dispose();
-    mesh.geometry = new THREE.PlaneGeometry(work.width, work.width / aspect);
-  }
+  layoutArtwork(mesh, work);
   if (work.wallKey || work.wallId != null) {
     const wall = wallHost(work);
     if (wall) poseOnWall(mesh, wall, work.wallAxis || "x", work.wallSide || 1, clamped.offsetY, clamped.offsetZ);
@@ -540,6 +870,7 @@ function showCursor(work) {
   const el = cursorEl();
   if (!el) return;
   el.hidden = false;
+  el.dataset.frame = work.frame || "none";
   el.innerHTML = work.image
     ? `<img src="${work.image}" alt="" />`
     : `<span>${escapeHtml(work.title || "未命名")}</span>`;
@@ -567,11 +898,137 @@ export function carryingArtwork() {
   return Boolean(carrying);
 }
 
-function disposeMesh(mesh) {
-  mesh.geometry.dispose();
-  if (mesh.material?.map) mesh.material.map.dispose();
-  mesh.material?.dispose();
-  mesh.parent?.remove(mesh);
+function disposeMesh(object) {
+  object.traverse((node) => {
+    if (!node.isMesh) return;
+    node.geometry?.dispose();
+    const materials = Array.isArray(node.material) ? node.material : [node.material];
+    for (const mat of materials) {
+      if (!mat || mat.userData.shared) continue;
+      mat.map?.dispose();
+      mat.dispose();
+    }
+  });
+  object.parent?.remove(object);
+}
+
+const FRAME_PRESETS = [
+  { id: "none", name: "无框", hint: "直接上墙", swatch: "" },
+  { id: "black", name: "窄黑框", hint: "细黑木线", swatch: "border:4px solid #1a1a1a", face: 0.028, depth: 0.02, color: 0x1a1a1a, roughness: 0.55 },
+  { id: "white", name: "窄白框", hint: "细白木线", swatch: "border:4px solid #f7f4ee;box-shadow:0 0 0 1px #c9c3b8", face: 0.028, depth: 0.02, color: 0xf4f1ea, roughness: 0.62 },
+  { id: "gold", name: "金框", hint: "古典贴金", swatch: "border:6px solid #c6a15b", face: 0.042, depth: 0.028, color: 0xc6a15b, roughness: 0.38, metalness: 0.45 },
+  { id: "oak", name: "原木框", hint: "浅橡木", swatch: "border:6px solid #c4a574", face: 0.048, depth: 0.032, color: 0xc4a574, roughness: 0.72 },
+  { id: "walnut", name: "胡桃木框", hint: "深色宽边", swatch: "border:8px solid #5a3a28", face: 0.07, depth: 0.04, color: 0x5a3a28, roughness: 0.68 },
+  { id: "silver", name: "银框", hint: "金属细边", swatch: "border:3px solid #c5c8cc", face: 0.018, depth: 0.016, color: 0xc5c8cc, roughness: 0.28, metalness: 0.72 },
+  { id: "mat", name: "卡纸衬", hint: "白卡纸加细黑框", swatch: "border:3px solid #1a1a1a;padding:5px;background:#f7f4ee", face: 0.022, depth: 0.02, color: 0x1c1c1c, roughness: 0.5, mat: 0.07 },
+];
+
+const frameMaterials = new Map();
+let matBoardMaterial = null;
+
+function framePreset(id) {
+  return FRAME_PRESETS.find((item) => item.id === id) || FRAME_PRESETS[0];
+}
+
+function frameLabel(id) {
+  if (!id || id === "none") return "";
+  return framePreset(id).name;
+}
+
+function frameMaterial(spec) {
+  let mat = frameMaterials.get(spec.id);
+  if (!mat) {
+    mat = new THREE.MeshStandardMaterial({
+      color: spec.color,
+      roughness: spec.roughness ?? 0.6,
+      metalness: spec.metalness ?? 0,
+    });
+    mat.userData.shared = true;
+    frameMaterials.set(spec.id, mat);
+  }
+  return mat;
+}
+
+function boardMaterial() {
+  if (!matBoardMaterial) {
+    matBoardMaterial = new THREE.MeshStandardMaterial({ color: 0xf7f4ee, roughness: 0.86, metalness: 0 });
+    matBoardMaterial.userData.shared = true;
+  }
+  return matBoardMaterial;
+}
+
+function addMoulding(group, width, height, face, depth, material) {
+  const z = depth / 2;
+  const bars = [
+    [width + face * 2, face, depth, 0, height / 2 + face / 2],
+    [width + face * 2, face, depth, 0, -(height / 2 + face / 2)],
+    [face, height, depth, -(width / 2 + face / 2), 0],
+    [face, height, depth, width / 2 + face / 2, 0],
+  ];
+  for (const [w, h, d, x, y] of bars) {
+    const bar = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), material);
+    bar.position.set(x, y, z);
+    bar.castShadow = true;
+    bar.layers.enable(1);
+    group.add(bar);
+  }
+}
+
+function rebuildFrame(root, frameId, width, height) {
+  const old = root.getObjectByName("frame");
+  if (old) {
+    old.traverse((node) => {
+      if (node.isMesh) node.geometry?.dispose();
+    });
+    root.remove(old);
+  }
+  const picture = root.getObjectByName("picture");
+  const spec = framePreset(frameId);
+  if (!spec.face) {
+    if (picture) picture.position.z = 0;
+    return;
+  }
+  const group = new THREE.Group();
+  group.name = "frame";
+  const matGap = spec.mat || 0;
+  if (matGap) {
+    const board = new THREE.Mesh(
+      new THREE.PlaneGeometry(width + matGap * 2, height + matGap * 2),
+      boardMaterial()
+    );
+    board.position.z = spec.depth * 0.28;
+    board.layers.enable(1);
+    group.add(board);
+  }
+  addMoulding(group, width + matGap * 2, height + matGap * 2, spec.face, spec.depth, frameMaterial(spec));
+  if (picture) picture.position.z = spec.depth * (matGap ? 0.55 : 0.42);
+  root.add(group);
+}
+
+function layoutArtwork(root, work) {
+  if (!root?.isGroup) return;
+  const aspect = work.aspect || 0.8;
+  const width = work.width;
+  const frame = work.frame || "none";
+  root.userData.width = width;
+  root.userData.aspect = aspect;
+  root.userData.fixed = Boolean(work.poster);
+  if (
+    Math.abs((root.userData.laidWidth || 0) - width) < 0.001 &&
+    Math.abs((root.userData.laidAspect || 0) - aspect) < 0.001 &&
+    root.userData.laidFrame === frame
+  ) {
+    return;
+  }
+  const picture = root.getObjectByName("picture");
+  if (picture) {
+    picture.geometry.dispose();
+    picture.geometry = new THREE.PlaneGeometry(width, width / aspect);
+  }
+  rebuildFrame(root, frame, width, width / aspect);
+  root.userData.laidWidth = width;
+  root.userData.laidAspect = aspect;
+  root.userData.laidFrame = frame;
 }
 
 async function ensureMesh(work) {
@@ -580,21 +1037,22 @@ async function ensureMesh(work) {
   const source = work.image ? await textureFromDataUrl(work.image) : textureFromCanvas(cardCanvas(work));
   work.aspect = source.aspect;
   work.width = clampWidth(work.aspect, work.width, limitsOf(work));
-  const mesh = new THREE.Mesh(
+  const root = new THREE.Group();
+  root.name = `work-${work.id}`;
+  root.userData.isArtwork = true;
+  root.userData.workId = work.id;
+  const picture = new THREE.Mesh(
     new THREE.PlaneGeometry(work.width, work.width / work.aspect),
     new THREE.MeshBasicMaterial({ map: source.tex })
   );
-  mesh.name = `work-${work.id}`;
-  mesh.userData.isArtwork = true;
-  mesh.userData.workId = work.id;
-  mesh.userData.aspect = work.aspect;
-  mesh.userData.width = work.width;
-  mesh.visible = false;
-  mesh.renderOrder = 3;
-  mesh.layers.enable(1);
-  mesh.userData.fixed = Boolean(work.poster);
-  holder().add(mesh);
-  return mesh;
+  picture.name = "picture";
+  picture.renderOrder = 3;
+  picture.layers.enable(1);
+  root.add(picture);
+  root.visible = false;
+  layoutArtwork(root, work);
+  holder().add(root);
+  return root;
 }
 
 function rememberPlace(work) {
@@ -661,6 +1119,7 @@ function placedHost(work) {
 function startCarry(work, x, y) {
   if (viewOnly || spotMode) return;
   if (decorCarry) stopDecorCarry(false);
+  if (installCarry) stopInstallCarry(false);
   if (carrying && carrying !== work) stopCarry(false);
   carrySnapshot = rememberPlace(work);
   carrying = work;
@@ -951,6 +1410,7 @@ function renderWorks() {
           <strong>${escapeHtml(work.title || "未命名")}</strong>
           <p>${escapeHtml([work.artist, work.year].filter(Boolean).join(" · ") || "未填写作者")}</p>
           ${work.note ? `<p class="work-note">${escapeHtml(work.note)}</p>` : ""}
+          ${frameLabel(work.frame) ? `<p class="work-note">画框：${escapeHtml(frameLabel(work.frame))}</p>` : ""}
           <p class="status">${status}</p>
           <label class="size-row">墙上大小
             <input class="size-range" type="range" min="0.22" max="${maxWidthFor(work.aspect || 0.8, limits)}" step="0.01" value="${width}" />
@@ -983,17 +1443,25 @@ function formatWhen(ts) {
 
 function setStudio(open) {
   document.getElementById("show-studio").hidden = !open;
-  document.getElementById("show-form").hidden = open;
+  document.getElementById("open-show-dialog").hidden = open;
+  document.getElementById("show-list-title").hidden = open;
+  document.getElementById("show-dialog").hidden = true;
+  document.getElementById("show-menu").hidden = true;
   document.getElementById("show-list").hidden = open;
+  document.getElementById("install-dialog").hidden = true;
   const intro = document.getElementById("curate-intro");
   if (intro) intro.hidden = open;
   if (!open) {
     document.getElementById("work-dialog").hidden = true;
     document.getElementById("decor-dialog").hidden = true;
+    document.getElementById("install-dialog").hidden = true;
     if (decorCarry) stopDecorCarry(false);
+    if (installCarry) stopInstallCarry(false);
     setSpotMode(false);
   }
   const show = currentShow();
+  const title = document.getElementById("curate-title");
+  if (title) title.textContent = show && open ? show.name : "虚拟策展";
   document.getElementById("show-now").textContent = show && open ? show.name : "";
 }
 
@@ -1007,29 +1475,48 @@ function renderShows() {
     .map((show) => {
       const when = formatWhen(show.updatedAt || show.createdAt);
       const decorCount = Array.isArray(show.decorations) ? show.decorations.length : 0;
+      const installCount = Array.isArray(show.installations) ? show.installations.length : 0;
       return `<article class="show-card${show.id === activeId ? " active" : ""}" data-show="${show.id}">
         <button type="button" class="show-open" data-act="open">
           <strong>${escapeHtml(show.name)}</strong>
-          <span>${show.works.filter((work) => !work.poster).length} 件作品${decorCount ? ` · ${decorCount} 件装饰` : ""}${when ? ` · ${when}` : ""}</span>
+          <span>${show.works.filter((work) => !work.poster).length} 件作品${installCount ? ` · ${installCount} 件装置` : ""}${decorCount ? ` · ${decorCount} 件装饰` : ""}${when ? ` · ${when}` : ""}</span>
         </button>
-        <button type="button" class="show-delete" data-act="delete-show">删除</button>
       </article>`;
     })
     .join("");
 }
 
 function activateShow(show) {
+  if (installCarry) stopInstallCarry(false);
   activeId = show.id;
   works = show.works;
   decors = show.decorations;
+  installs = show.installations;
   applyLayout(show.layout);
   clearAllArt();
   applyMounts();
   mountDecors();
+  mountInstalls();
   publishSpots();
   setStudio(true);
   renderShows();
   renderWorks();
+  renderDecors();
+  renderInstalls();
+}
+
+function renameShow(id, name) {
+  const show = shows.find((item) => item.id === id);
+  if (!show) return;
+  show.name = name;
+  show.updatedAt = Date.now();
+  if (activeId === id) {
+    document.getElementById("show-now").textContent = name;
+    const title = document.getElementById("curate-title");
+    if (title && !document.getElementById("show-studio").hidden) title.textContent = name;
+  }
+  saveStore();
+  renderShows();
 }
 
 function createShow(name) {
@@ -1042,6 +1529,7 @@ function createShow(name) {
     layout: baseLayout.map((spot) => ({ ...spot })),
     works: [],
     decorations: [],
+    installations: [],
   };
   shows.unshift(show);
   saveStore();
@@ -1070,32 +1558,94 @@ function deleteShow(id) {
     activeId = null;
     works = [];
     decors = [];
+    installs = [];
     clearAllArt();
+    clearInstallMeshes();
     publishSpots();
     applyLayout(baseLayout);
     setStudio(false);
     renderWorks();
+    renderInstalls();
   }
   saveStore();
   renderShows();
 }
 
 function bindShows() {
-  document.getElementById("show-form").addEventListener("submit", (event) => {
+  const dialog = document.getElementById("show-dialog");
+  const form = document.getElementById("show-form");
+  const menu = document.getElementById("show-menu");
+  const title = dialog.querySelector("h2");
+  const nameInput = form.querySelector("input[name=name]");
+  let renameId = null;
+
+  function closeMenu() {
+    menu.hidden = true;
+  }
+
+  function openShowDialog(id) {
+    closeMenu();
+    form.reset();
+    const show = id ? shows.find((item) => item.id === id) : null;
+    renameId = show ? show.id : null;
+    title.textContent = show ? "重命名" : "新建展览";
+    if (show) nameInput.value = show.name;
+    dialog.hidden = false;
+    nameInput.focus();
+    if (show) nameInput.select();
+  }
+
+  document.getElementById("open-show-dialog").addEventListener("click", () => openShowDialog(null));
+  dialog.addEventListener("click", (event) => {
+    if (event.target === dialog) {
+      dialog.hidden = true;
+      renameId = null;
+    }
+  });
+  dialog.querySelector("[data-dialog=cancel]").addEventListener("click", () => {
+    dialog.hidden = true;
+    renameId = null;
+  });
+  form.addEventListener("submit", (event) => {
     event.preventDefault();
-    const form = event.currentTarget;
     const name = String(new FormData(form).get("name") || "").trim();
     if (!name) return;
-    createShow(name);
+    if (renameId) renameShow(renameId, name);
+    else createShow(name);
+    renameId = null;
     form.reset();
+    dialog.hidden = true;
+  });
+  document.getElementById("show-list").addEventListener("contextmenu", (event) => {
+    const card = event.target.closest("[data-show]");
+    if (!card) return;
+    event.preventDefault();
+    menu.hidden = false;
+    menu.dataset.show = card.dataset.show;
+    const pad = 8;
+    const width = menu.offsetWidth;
+    const height = menu.offsetHeight;
+    menu.style.left = `${Math.min(event.clientX, window.innerWidth - width - pad)}px`;
+    menu.style.top = `${Math.min(event.clientY, window.innerHeight - height - pad)}px`;
+  });
+  menu.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-act]");
+    const id = menu.dataset.show;
+    if (!button || !id) return;
+    closeMenu();
+    if (button.dataset.act === "rename") openShowDialog(id);
+    if (button.dataset.act === "delete-show") deleteShow(id);
+  });
+  document.addEventListener("pointerdown", (event) => {
+    if (menu.hidden || menu.contains(event.target)) return;
+    closeMenu();
   });
   document.getElementById("show-list").addEventListener("click", (event) => {
     const button = event.target.closest("[data-act]");
     if (!button) return;
     const card = button.closest("[data-show]");
     if (!card) return;
-    if (button.dataset.act === "delete-show") deleteShow(card.dataset.show);
-    else openShow(card.dataset.show);
+    openShow(card.dataset.show);
   });
 }
 
@@ -1117,64 +1667,177 @@ function workFromCard(card) {
   return works.find((work) => work.id === card.dataset.id);
 }
 
-function bindWorks() {
-  document.getElementById("work-form").addEventListener("submit", async (event) => {
-    event.preventDefault();
-    if (viewOnly) return;
-    const form = event.currentTarget;
-    const data = new FormData(form);
-    const title = String(data.get("title") || "").trim();
-    if (!title || !currentShow()) return;
-    let image = null;
+let pendingImage = null;
+let pendingFrame = "none";
+
+function showWorkStep(step) {
+  document.getElementById("work-step-info").hidden = step !== "info";
+  document.getElementById("work-step-frame").hidden = step !== "frame";
+  document.getElementById("work-form").classList.toggle("frame-open", step === "frame");
+}
+
+function syncWorkSubmitLabel() {
+  const button = document.querySelector("#work-step-info button[type=submit]");
+  if (button) button.textContent = pendingImage ? "下一步" : "确认";
+  const note = document.getElementById("work-image-note");
+  if (note) note.hidden = !pendingImage;
+}
+
+function selectFrame(id) {
+  pendingFrame = framePreset(id).id;
+  const stage = document.getElementById("frame-stage");
+  if (stage) stage.dataset.frame = pendingFrame;
+  document.querySelectorAll(".frame-pick").forEach((button) => {
+    const on = button.dataset.frame === pendingFrame;
+    button.classList.toggle("on", on);
+    button.setAttribute("aria-pressed", on ? "true" : "false");
+  });
+}
+
+function showFrameStep() {
+  const img = document.getElementById("frame-preview-img");
+  if (img && pendingImage) img.src = pendingImage;
+  selectFrame(pendingFrame || "none");
+  showWorkStep("frame");
+}
+
+function resetWorkDialog() {
+  document.getElementById("work-form").reset();
+  pendingImage = null;
+  pendingFrame = "none";
+  const img = document.getElementById("frame-preview-img");
+  if (img) img.removeAttribute("src");
+  showWorkStep("info");
+  syncWorkSubmitLabel();
+}
+
+function renderFramePicks() {
+  const root = document.getElementById("frame-picks");
+  if (!root || root.childElementCount) return;
+  root.innerHTML = FRAME_PRESETS.map((item) => `<button type="button" class="frame-pick" data-frame="${item.id}" aria-pressed="false">
+      <span class="frame-swatch"><i style="${item.swatch}"></i></span>
+      <strong>${item.name}</strong>
+      <small>${item.hint}</small>
+    </button>`).join("");
+}
+
+let committingWork = false;
+
+async function commitWork() {
+  if (committingWork) return;
+  const form = document.getElementById("work-form");
+  const data = new FormData(form);
+  const title = String(data.get("title") || "").trim();
+  if (!title || !currentShow()) return;
+  committingWork = true;
+  try {
+  await finishWork(form, data, title);
+  } finally {
+    committingWork = false;
+  }
+}
+
+async function finishWork(form, data, title) {
+  const onFrame = !document.getElementById("work-step-frame").hidden;
+  let image = pendingImage;
+  if (!onFrame) {
     const file = data.get("image");
-    if (file && file.size) {
+    if (file && file.size && !image) {
       try {
         image = await fileToDataUrl(file);
+        pendingImage = image;
       } catch {
-        document.getElementById("curate-msg").textContent = "这张图片没有读出来，作品已按无图添加。";
+        image = null;
+        setMessage("这张图片没有读出来，作品已按无图添加。");
       }
     }
-    works.unshift({
-      id: newId(),
-      title,
-      artist: String(data.get("artist") || "").trim(),
-      year: String(data.get("year") || "").trim(),
-      note: String(data.get("note") || "").trim(),
-      image,
-      panel: null,
-      face: null,
-      offsetY: 0,
-      offsetZ: 0,
-    });
-    const work = works[0];
-    document.getElementById("work-dialog").hidden = true;
-    saveStore();
-    form.reset();
-    renderWorks();
-    renderShows();
-    try {
-      await ensureMesh(work);
-      const opener = document.getElementById("open-work-dialog").getBoundingClientRect();
-      startCarry(work, opener.left + opener.width / 2, opener.top + opener.height / 2);
-    } catch {
-      setMessage("作品已添加，但图片没能放到鼠标上。");
+    if (image) {
+      showFrameStep();
+      return;
     }
+  }
+  works.unshift({
+    id: newId(),
+    title,
+    artist: String(data.get("artist") || "").trim(),
+    year: String(data.get("year") || "").trim(),
+    note: String(data.get("note") || "").trim(),
+    image: image || null,
+    frame: image && pendingFrame && pendingFrame !== "none" ? pendingFrame : null,
+    panel: null,
+    face: null,
+    offsetY: 0,
+    offsetZ: 0,
   });
+  const work = works[0];
+  document.getElementById("work-dialog").hidden = true;
+  saveStore();
+  resetWorkDialog();
+  renderWorks();
+  renderShows();
+  try {
+    await ensureMesh(work);
+    const opener = document.getElementById("open-work-dialog").getBoundingClientRect();
+    startCarry(work, opener.left + opener.width / 2, opener.top + opener.height / 2);
+  } catch {
+    setMessage("作品已添加，但图片没能放到鼠标上。");
+  }
+}
 
+function bindWorks() {
+  renderFramePicks();
   const dialog = document.getElementById("work-dialog");
   const workForm = document.getElementById("work-form");
+  workForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (viewOnly) return;
+    commitWork();
+  });
+  workForm.querySelector("input[name=image]").addEventListener("change", async (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    try {
+      pendingImage = await fileToDataUrl(file);
+    } catch {
+      setMessage("这张图片没有读出来。");
+      return;
+    }
+    syncWorkSubmitLabel();
+    const title = String(new FormData(workForm).get("title") || "").trim();
+    if (title) showFrameStep();
+  });
+  document.getElementById("frame-picks").addEventListener("click", (event) => {
+    const pick = event.target.closest("[data-frame]");
+    if (!pick) return;
+    selectFrame(pick.dataset.frame);
+  });
+  document.getElementById("frame-confirm").addEventListener("click", () => {
+    if (viewOnly) return;
+    commitWork();
+  });
+  dialog.querySelector("[data-frame=back]").addEventListener("click", () => {
+    showWorkStep("info");
+    syncWorkSubmitLabel();
+    workForm.querySelector("input[name=title]").focus();
+  });
+
   document.getElementById("open-work-dialog").addEventListener("click", () => {
     if (viewOnly) return;
     document.getElementById("decor-dialog").hidden = true;
-    workForm.reset();
+    document.getElementById("install-dialog").hidden = true;
+    resetWorkDialog();
     dialog.hidden = false;
     workForm.querySelector("input[name=title]").focus();
   });
   dialog.addEventListener("click", (event) => {
-    if (event.target === dialog) dialog.hidden = true;
+    if (event.target === dialog) {
+      dialog.hidden = true;
+      resetWorkDialog();
+    }
   });
   dialog.querySelector("[data-dialog=cancel]").addEventListener("click", () => {
     dialog.hidden = true;
+    resetWorkDialog();
   });
 
   document.getElementById("tool-col").addEventListener("click", (event) => {
@@ -1250,13 +1913,22 @@ function bindWorks() {
       if (el) el.hidden = false;
       return;
     }
-    if (!decorCarry) return;
+    if (decorCarry) {
+      moveCursor(event.clientX, event.clientY);
+      const group = decorGroup(decorCarry);
+      if (group) group.visible = false;
+      decorPending = null;
+      const el = cursorEl();
+      if (el) el.hidden = false;
+      return;
+    }
+    if (!installCarry) return;
     moveCursor(event.clientX, event.clientY);
-    const group = decorGroup(decorCarry);
-    if (group) group.visible = false;
-    decorPending = null;
-    const el = cursorEl();
-    if (el) el.hidden = false;
+    const held = installGroup(installCarry);
+    if (held) held.visible = false;
+    installPending = null;
+    const cursor = cursorEl();
+    if (cursor) cursor.hidden = false;
   });
 let decorSpin = null;
 
@@ -1268,35 +1940,67 @@ document.addEventListener("pointerdown", (event) => {
     discardCarriedArtwork();
     return;
   }
-  if (!decorCarry) return;
+  if (decorCarry) {
+    event.preventDefault();
+    event.stopPropagation();
+    decorSpin = {
+      x: event.clientX,
+      rotationY: decorCarry.rotationY || 0,
+      moved: false,
+    };
+    return;
+  }
+  if (!installCarry) return;
   event.preventDefault();
   event.stopPropagation();
-  decorSpin = {
+  installSpin = {
     x: event.clientX,
-    rotationY: decorCarry.rotationY || 0,
+    rotationY: installCarry.rotationY || 0,
     moved: false,
   };
 }, true);
 document.addEventListener("pointermove", (event) => {
-  if (!decorSpin || !decorCarry) return;
-  const dx = event.clientX - decorSpin.x;
-  if (!decorSpin.moved && Math.abs(dx) < 4) return;
-  decorSpin.moved = true;
-  decorCarry.rotationY = decorSpin.rotationY - dx * 0.015;
-  const group = decorGroup(decorCarry);
-  if (group) group.rotation.y = decorCarry.rotationY;
+  if (decorSpin && decorCarry) {
+    const dx = event.clientX - decorSpin.x;
+    if (!decorSpin.moved && Math.abs(dx) < 4) return;
+    decorSpin.moved = true;
+    decorCarry.rotationY = decorSpin.rotationY - dx * 0.015;
+    const group = decorGroup(decorCarry);
+    if (group) group.rotation.y = decorCarry.rotationY;
+    return;
+  }
+  if (!installSpin || !installCarry) return;
+  const dx = event.clientX - installSpin.x;
+  if (!installSpin.moved && Math.abs(dx) < 4) return;
+  installSpin.moved = true;
+  installCarry.rotationY = installSpin.rotationY - dx * 0.015;
+  const group = installGroup(installCarry);
+  if (group) group.rotation.y = installCarry.rotationY;
 }, true);
 document.addEventListener("pointerup", (event) => {
-  if (event.button !== 2 || !decorSpin) return;
-  const spin = decorSpin;
-  decorSpin = null;
-  if (!spin.moved) discardCarriedDecoration();
+  if (event.button !== 2) return;
+  if (decorSpin) {
+    const spin = decorSpin;
+    decorSpin = null;
+    if (!spin.moved) discardCarriedDecoration();
+    return;
+  }
+  if (!installSpin) return;
+  const spin = installSpin;
+  installSpin = null;
+  if (!spin.moved) discardCarriedInstallation();
 }, true);
   document.addEventListener("contextmenu", (event) => {
-    if (carrying || decorCarry) event.preventDefault();
+    if (carrying || decorCarry || installCarry) event.preventDefault();
   });
   document.addEventListener("keydown", (event) => {
     if (event.key !== "Escape") return;
+    const installDialog = document.getElementById("install-dialog");
+    if (installDialog && !installDialog.hidden) {
+      installDialog.hidden = true;
+      resetInstallDialog();
+      return;
+    }
     const decorDialog = document.getElementById("decor-dialog");
     if (decorDialog && !decorDialog.hidden) {
       decorDialog.hidden = true;
@@ -1305,6 +2009,10 @@ document.addEventListener("pointerup", (event) => {
     const dialog = document.getElementById("work-dialog");
     if (dialog && !dialog.hidden) {
       dialog.hidden = true;
+      return;
+    }
+    if (installCarry) {
+      stopInstallCarry(false);
       return;
     }
     if (decorCarry) {
@@ -1627,6 +2335,7 @@ function showDecorCursor(item) {
 function startDecorCarry(item, x, y) {
   if (viewOnly || spotMode) return;
   if (carrying) stopCarry(false);
+  if (installCarry) stopInstallCarry(false);
   if (decorCarry && decorCarry !== item) stopDecorCarry(false);
   decorSnapshot = Number.isFinite(item.x) ? { x: item.x, z: item.z, rotationY: item.rotationY || 0 } : null;
   decorCarry = item;
@@ -1902,12 +2611,677 @@ function addDecor(kind, x, y) {
   startDecorCarry(item, x, y);
 }
 
+const installMat = new THREE.MeshStandardMaterial({
+  color: 0xf3efe6,
+  roughness: 0.58,
+  metalness: 0.04,
+  flatShading: true,
+});
+const STL_LIMIT = Math.floor(3.5 * 1024 * 1024);
+const STL_TRI_LIMIT = 200000;
+
+function waitFrame() {
+  return new Promise((resolve) => {
+    requestAnimationFrame(() => resolve());
+  });
+}
+
+function bufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  const chunk = 8192;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + chunk, bytes.length)));
+  }
+  return btoa(binary);
+}
+
+function base64ToBuffer(value) {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  const chunk = 8192;
+  for (let i = 0; i < binary.length; i += chunk) {
+    const end = Math.min(i + chunk, binary.length);
+    for (let j = i; j < end; j += 1) bytes[j] = binary.charCodeAt(j);
+  }
+  return bytes.buffer;
+}
+
+function bufferToLatin1(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let text = "";
+  const chunk = 8192;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    text += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + chunk, bytes.length)));
+  }
+  return text;
+}
+
+function binaryFaceCount(view) {
+  if (view.byteLength < 84) return 0;
+  const count = view.getUint32(80, true);
+  if (!Number.isInteger(count) || count < 1 || count > STL_TRI_LIMIT) return 0;
+  const expect = 84 + count * 50;
+  if (expect > view.byteLength || view.byteLength - expect > 4096) return 0;
+  return count;
+}
+
+function parseBinaryStl(view, count) {
+  const positions = new Float32Array(count * 9);
+  let offset = 84;
+  let cursor = 0;
+  let minX = Infinity;
+  let minY = Infinity;
+  let minZ = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  let maxZ = -Infinity;
+  let finite = 0;
+  for (let i = 0; i < count; i += 1) {
+    offset += 12;
+    for (let k = 0; k < 3; k += 1) {
+      let x = view.getFloat32(offset, true);
+      let y = view.getFloat32(offset + 4, true);
+      let z = view.getFloat32(offset + 8, true);
+      offset += 12;
+      if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
+        x = 0;
+        y = 0;
+        z = 0;
+      } else {
+        finite += 1;
+        if (x < minX) minX = x;
+        if (y < minY) minY = y;
+        if (z < minZ) minZ = z;
+        if (x > maxX) maxX = x;
+        if (y > maxY) maxY = y;
+        if (z > maxZ) maxZ = z;
+      }
+      positions[cursor] = x;
+      positions[cursor + 1] = y;
+      positions[cursor + 2] = z;
+      cursor += 3;
+    }
+    offset += 2;
+  }
+  return { positions, minX, minY, minZ, maxX, maxY, maxZ, finite };
+}
+
+function parseAsciiStl(text) {
+  const values = [];
+  const lines = text.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i].trim();
+    if (!line || line[0] !== "v" && line[0] !== "V") continue;
+    if (!line.toLowerCase().startsWith("vertex")) continue;
+    const parts = line.split(/\s+/);
+    if (parts.length < 4) continue;
+    values.push(Number(parts[1]), Number(parts[2]), Number(parts[3]));
+    if (values.length / 9 > STL_TRI_LIMIT) {
+      const error = new Error("heavy");
+      error.code = "heavy";
+      throw error;
+    }
+  }
+  return values;
+}
+
+function geometryFromPositions(positions, bounds) {
+  const array = positions instanceof Float32Array ? positions : new Float32Array(positions);
+  if (array.length < 9 || array.length % 9 !== 0) {
+    const error = new Error("empty");
+    error.code = "empty";
+    throw error;
+  }
+  let { minX, minY, minZ, maxX, maxY, maxZ, finite } = bounds || {};
+  if (!Number.isFinite(finite)) {
+    minX = Infinity;
+    minY = Infinity;
+    minZ = Infinity;
+    maxX = -Infinity;
+    maxY = -Infinity;
+    maxZ = -Infinity;
+    finite = 0;
+    for (let i = 0; i < array.length; i += 3) {
+      const x = array[i];
+      const y = array[i + 1];
+      const z = array[i + 2];
+      if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
+      finite += 1;
+      if (x < minX) minX = x;
+      if (y < minY) minY = y;
+      if (z < minZ) minZ = z;
+      if (x > maxX) maxX = x;
+      if (y > maxY) maxY = y;
+      if (z > maxZ) maxZ = z;
+    }
+  }
+  const maxDim = Math.max(maxX - minX, maxY - minY, maxZ - minZ);
+  if (finite < 3 || !Number.isFinite(maxDim) || maxDim <= 0) {
+    const error = new Error("empty");
+    error.code = "empty";
+    throw error;
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(array, 3));
+  geometry.translate(-(minX + maxX) / 2, -minY, -(minZ + maxZ) / 2);
+  geometry.scale(1 / maxDim, 1 / maxDim, 1 / maxDim);
+  return geometry;
+}
+
+function geometryFromBuffer(buffer) {
+  const view = new DataView(buffer);
+  const faceCount = binaryFaceCount(view);
+  if (faceCount) {
+    const parsed = parseBinaryStl(view, faceCount);
+    return geometryFromPositions(parsed.positions, parsed);
+  }
+  const head = bufferToLatin1(buffer.slice(0, Math.min(buffer.byteLength, 2048))).toLowerCase();
+  if (!head.includes("facet") && !head.startsWith("solid")) {
+    const error = new Error("empty");
+    error.code = "empty";
+    throw error;
+  }
+  return geometryFromPositions(parseAsciiStl(bufferToLatin1(buffer)));
+}
+
+function geometryFromStl(stl) {
+  return geometryFromBuffer(base64ToBuffer(stl));
+}
+
+function normalizeInstallations(show) {
+  if (!Array.isArray(show.installations)) show.installations = [];
+  show.installations = show.installations.filter((item) => item && typeof item.stl === "string" && item.stl);
+  for (const item of show.installations) {
+    if (!item.title) item.title = "未命名";
+    if (!Number.isFinite(Number(item.scale))) item.scale = 1;
+    if (!Number.isFinite(Number(item.rotationY))) item.rotationY = 0;
+  }
+}
+
+function installHolder() {
+  if (!installRoot) {
+    installRoot = new THREE.Group();
+    installRoot.name = "install";
+    panels[0].parent.add(installRoot);
+  }
+  return installRoot;
+}
+
+function installGroup(item) {
+  if (!item || !installRoot) return null;
+  return installRoot.children.find((child) => child.userData.installId === item.id) || null;
+}
+
+function disposeInstall(group) {
+  group.traverse((obj) => {
+    if (obj.geometry) obj.geometry.dispose();
+  });
+  group.parent?.remove(group);
+}
+
+function clearInstallMeshes() {
+  const carried = Boolean(installCarry);
+  installCarry = null;
+  installSnapshot = null;
+  installPending = null;
+  installMove = null;
+  installScaleDrag = null;
+  installSpin = null;
+  if (carried) hideCursor();
+  if (!installRoot) return;
+  for (const child of [...installRoot.children]) disposeInstall(child);
+}
+
+function spawnInstall(item, ready) {
+  const geometry = ready || geometryFromStl(item.stl);
+  const group = new THREE.Group();
+  const mesh = new THREE.Mesh(geometry, installMat);
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  group.add(mesh);
+  group.userData.isInstall = true;
+  group.userData.installId = item.id;
+  addScaleHandle(group);
+  group.position.set(Number.isFinite(item.x) ? item.x : 0, 0, Number.isFinite(item.z) ? item.z : 0);
+  group.rotation.y = item.rotationY || 0;
+  const scale = installScaleOf(item);
+  group.scale.set(scale, scale, scale);
+  const handle = group.children.find((child) => child.userData.isScaleHandle);
+  if (handle) handle.scale.setScalar(1 / scale);
+  group.traverse((node) => {
+    if (node.isMesh && !node.userData.isScaleHandle) node.layers.enable(1);
+  });
+  group.visible = Number.isFinite(item.x) && Number.isFinite(item.z);
+  installHolder().add(group);
+  return group;
+}
+
+function mountInstalls() {
+  if (installRoot) {
+    for (const child of [...installRoot.children]) disposeInstall(child);
+  }
+  for (const item of installs) {
+    try {
+      spawnInstall(item);
+    } catch {
+      /* skip a file that no longer parses */
+    }
+  }
+}
+
+function showInstallCursor(item) {
+  const el = cursorEl();
+  if (!el) return;
+  el.hidden = false;
+  el.innerHTML = `<span>${escapeHtml(item.title || "装置")}</span>`;
+}
+
+function startInstallCarry(item, x, y) {
+  if (viewOnly || spotMode) return;
+  if (carrying) stopCarry(false);
+  if (decorCarry) stopDecorCarry(false);
+  if (installCarry && installCarry !== item) stopInstallCarry(false);
+  installSnapshot = Number.isFinite(item.x) ? { x: item.x, z: item.z, rotationY: item.rotationY || 0 } : null;
+  installCarry = item;
+  installPending = null;
+  const group = installGroup(item);
+  if (group) group.visible = false;
+  showInstallCursor(item);
+  if (Number.isFinite(x) && Number.isFinite(y)) moveCursor(x, y);
+  renderInstalls();
+}
+
+function stopInstallCarry(commit) {
+  const item = installCarry;
+  const snapshot = installSnapshot;
+  installCarry = null;
+  installSnapshot = null;
+  installPending = null;
+  hideCursor();
+  if (!item) return;
+  const group = installGroup(item);
+  if (!commit) {
+    if (snapshot) {
+      item.x = snapshot.x;
+      item.z = snapshot.z;
+      item.rotationY = snapshot.rotationY;
+      if (group) {
+        group.visible = true;
+        group.position.set(item.x, 0, item.z);
+        group.rotation.y = item.rotationY;
+      }
+    } else if (group) {
+      disposeInstall(group);
+      const index = installs.findIndex((entry) => entry.id === item.id);
+      if (index >= 0) installs.splice(index, 1);
+    }
+  } else if (group) {
+    group.visible = Number.isFinite(item.x);
+  }
+  renderInstalls();
+}
+
+export function carryingInstallation() {
+  return Boolean(installCarry);
+}
+
+export function installationTargets() {
+  return installRoot ? [...installRoot.children] : [];
+}
+
+export function installationFromHit(intersections) {
+  for (const hit of intersections) {
+    let node = hit.object;
+    let handle = null;
+    while (node) {
+      if (node.userData.isScaleHandle) handle = node;
+      if (node.userData.isInstall) return { group: node, handle, distance: hit.distance };
+      node = node.parent;
+    }
+  }
+  return null;
+}
+
+export function previewInstall(point, x, y) {
+  if (!installCarry) return;
+  moveCursor(x, y);
+  const group = installGroup(installCarry);
+  const el = cursorEl();
+  if (!group || !point || !insideFloor(point.x, point.z)) {
+    installPending = null;
+    if (group) group.visible = false;
+    if (el) el.hidden = false;
+    return;
+  }
+  installPending = { x: point.x, z: point.z };
+  group.visible = true;
+  group.position.set(point.x, 0, point.z);
+  if (el) el.hidden = true;
+}
+
+export function discardCarriedInstallation() {
+  if (!installCarry) return false;
+  const item = installCarry;
+  installCarry = null;
+  installSnapshot = null;
+  installPending = null;
+  hideCursor();
+  const group = installGroup(item);
+  if (group) disposeInstall(group);
+  const index = installs.findIndex((entry) => entry.id === item.id);
+  if (index >= 0) installs.splice(index, 1);
+  saveStore();
+  renderInstalls();
+  renderShows();
+  return true;
+}
+
+export function placeInstall() {
+  if (!installCarry || !installPending) return false;
+  const item = installCarry;
+  item.x = round(installPending.x);
+  item.z = round(installPending.z);
+  const group = installGroup(item);
+  if (group) {
+    group.visible = true;
+    group.position.set(item.x, 0, item.z);
+    group.rotation.y = item.rotationY || 0;
+  }
+  stopInstallCarry(true);
+  saveStore();
+  renderShows();
+  return true;
+}
+
+export function beginInstallMove(group) {
+  if (installCarry || carrying || decorCarry || !group?.userData.isInstall) return false;
+  const item = installs.find((entry) => entry.id === group.userData.installId);
+  if (!item) return false;
+  installMove = { item, group };
+  return true;
+}
+
+export function moveInstall(x, z) {
+  if (!installMove || !insideFloor(x, z)) return;
+  installMove.item.x = x;
+  installMove.item.z = z;
+  installMove.group.position.set(x, 0, z);
+}
+
+export function beginInstallScale(group, point) {
+  if (!point || !beginInstallMove(group)) return false;
+  const dx = point.x - group.position.x;
+  const dz = point.z - group.position.z;
+  installScaleDrag = {
+    dist: Math.max(0.25, Math.hypot(dx, dz)),
+    scale: installScaleOf(installMove.item),
+  };
+  return true;
+}
+
+export function scaleInstallMove(x, z) {
+  if (!installMove || !installScaleDrag) return;
+  const dist = Math.hypot(x - installMove.group.position.x, z - installMove.group.position.z);
+  applyInstallScale(installMove.item, installScaleDrag.scale * (dist / installScaleDrag.dist), false);
+}
+
+export function endInstallGesture() {
+  if (installMove?.group) {
+    installMove.item.x = round(installMove.group.position.x);
+    installMove.item.z = round(installMove.group.position.z);
+    installMove.item.rotationY = round(installMove.group.rotation.y);
+  }
+  installMove = null;
+  installScaleDrag = null;
+  saveStore();
+  renderInstalls();
+  renderShows();
+}
+
+function removeInstall(id) {
+  if (installCarry?.id === id) stopInstallCarry(true);
+  const index = installs.findIndex((item) => item.id === id);
+  if (index < 0) return;
+  const group = installGroup(installs[index]);
+  if (group) disposeInstall(group);
+  installs.splice(index, 1);
+  saveStore();
+  renderInstalls();
+  renderShows();
+}
+
+function installScaleOf(item) {
+  const value = Number(item?.scale);
+  if (!Number.isFinite(value)) return 1;
+  return Math.min(2.2, Math.max(0.4, value));
+}
+
+function applyInstallScale(item, scale, persist) {
+  const next = Math.min(2.2, Math.max(0.4, scale));
+  item.scale = round(next);
+  const group = installGroup(item);
+  if (group) {
+    group.scale.set(next, next, next);
+    const handle = group.children.find((child) => child.userData.isScaleHandle);
+    if (handle) handle.scale.setScalar(1 / next);
+  }
+  const card = document.querySelector(`.work-card[data-install="${CSS.escape(item.id)}"]`);
+  const label = card?.querySelector(".size-label");
+  if (label) label.textContent = `${next.toFixed(2)}×`;
+  if (persist) saveStore();
+}
+
+function renderInstalls() {
+  const list = document.getElementById("install-list");
+  const count = document.getElementById("install-count");
+  if (!list || !count) return;
+  count.textContent = installs.length ? String(installs.length) : "";
+  if (!installs.length) {
+    list.innerHTML = `<p class="empty">导入 STL 后，装置会跟着鼠标。在地面上点击放下。跟着鼠标时，右键拖动可绕自身转一圈，右键点击可删除。放下后可拖动改位置，拖透明圆点改大小，右键拖动绕自身旋转。</p>`;
+    return;
+  }
+  list.innerHTML = installs
+    .map((item) => {
+      const held = installCarry?.id === item.id;
+      const placed = Number.isFinite(item.x);
+      const scale = installScaleOf(item);
+      const status = held ? "在鼠标上，点到地面放下" : placed ? "拖动改位置，拖透明圆点改大小，右键转向" : "尚未放置";
+      const byline = [item.artist, item.year].filter(Boolean).join(" · ");
+      return `<article class="work-card" data-install="${item.id}">
+        <span class="ph">${escapeHtml(item.title || "装置")}</span>
+        <div class="work-body">
+          <strong>${escapeHtml(item.title || "未命名")}</strong>
+          <p>${escapeHtml(byline || "未填写作者")}</p>
+          ${item.note ? `<p class="work-note">${escapeHtml(item.note)}</p>` : ""}
+          <p class="status">${status}</p>
+          <label class="size-row">大小
+            <input class="install-scale" type="range" min="0.4" max="2.2" step="0.05" value="${scale}" />
+            <span class="size-label">${scale.toFixed(2)}×</span>
+          </label>
+          <div class="work-actions">
+            <button type="button" data-act="carry-install">${held ? "取消" : placed ? "拿起" : "放置"}</button>
+            <button type="button" data-act="delete-install">删除</button>
+          </div>
+        </div>
+      </article>`;
+    })
+    .join("");
+}
+
+function resetInstallDialog() {
+  const form = document.getElementById("install-form");
+  form?.reset();
+  const note = document.getElementById("install-file-note");
+  if (note) {
+    note.hidden = true;
+    note.textContent = "";
+  }
+}
+
+let installBusy = false;
+
+function installNote(text) {
+  const note = document.getElementById("install-file-note");
+  if (!note) return;
+  note.hidden = !text;
+  note.textContent = text || "";
+}
+
+async function commitInstall() {
+  if (installBusy) return;
+  const form = document.getElementById("install-form");
+  const dialog = document.getElementById("install-dialog");
+  const submit = form.querySelector("[type=submit]");
+  const data = new FormData(form);
+  const title = String(data.get("title") || "").trim();
+  if (!title || !currentShow()) return;
+  const file = data.get("stl");
+  const name = String(file?.name || "").toLowerCase();
+  if (!file || !file.size) {
+    installNote("请选择一个 STL 文件。");
+    return;
+  }
+  if (!name.endsWith(".stl")) {
+    installNote("请导入 STL 格式的文件。");
+    return;
+  }
+  if (file.size > STL_LIMIT) {
+    installNote("这个 STL 太大，没法保存在本机。请先把文件压到 3.5 MB 以内。");
+    return;
+  }
+  installBusy = true;
+  submit.disabled = true;
+  installNote("正在导入…");
+  await waitFrame();
+  let geometry = null;
+  try {
+    const buffer = await file.arrayBuffer();
+    await waitFrame();
+    geometry = geometryFromBuffer(buffer);
+    const show = currentShow();
+    if (!Array.isArray(show.installations)) show.installations = [];
+    installs = show.installations;
+    const item = {
+      id: newId(),
+      title,
+      artist: String(data.get("artist") || "").trim(),
+      year: String(data.get("year") || "").trim(),
+      note: String(data.get("note") || "").trim(),
+      stl: bufferToBase64(buffer),
+      x: null,
+      z: null,
+      rotationY: 0,
+      scale: 1,
+    };
+    installs.unshift(item);
+    try {
+      spawnInstall(item, geometry);
+      geometry = null;
+    } catch (error) {
+      installs.shift();
+      const group = installGroup(item);
+      if (group) disposeInstall(group);
+      throw error;
+    }
+    dialog.hidden = true;
+    resetInstallDialog();
+    renderInstalls();
+    renderShows();
+    const opener = document.getElementById("open-install-dialog").getBoundingClientRect();
+    startInstallCarry(item, opener.left + opener.width / 2, opener.top + opener.height / 2);
+    await waitFrame();
+    saveStore();
+  } catch (error) {
+    geometry?.dispose();
+    installNote(error?.code === "heavy" ? "这个模型面数太多，请先减面后再导入。" : "这个 STL 没有读出来。请确认文件没有损坏。");
+  } finally {
+    installBusy = false;
+    if (submit) submit.disabled = false;
+  }
+}
+
+function bindInstalls() {
+  const dialog = document.getElementById("install-dialog");
+  const form = document.getElementById("install-form");
+  document.getElementById("open-install-dialog").addEventListener("click", () => {
+    if (viewOnly) return;
+    document.getElementById("work-dialog").hidden = true;
+    document.getElementById("decor-dialog").hidden = true;
+    resetInstallDialog();
+    dialog.hidden = false;
+    form.querySelector("input[name=title]").focus();
+  });
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (viewOnly) return;
+    commitInstall();
+  });
+  form.querySelector("input[name=stl]").addEventListener("change", (event) => {
+    const file = event.target.files?.[0];
+    const note = document.getElementById("install-file-note");
+    if (!note) return;
+    if (!file) {
+      note.hidden = true;
+      note.textContent = "";
+      return;
+    }
+    note.hidden = false;
+    note.textContent = `已选择 ${file.name}`;
+  });
+  dialog.addEventListener("click", (event) => {
+    if (event.target === dialog) {
+      dialog.hidden = true;
+      resetInstallDialog();
+    }
+  });
+  dialog.querySelector("[data-dialog=cancel]").addEventListener("click", () => {
+    dialog.hidden = true;
+    resetInstallDialog();
+  });
+  document.getElementById("install-list").addEventListener("input", (event) => {
+    if (viewOnly) return;
+    if (!event.target.classList.contains("install-scale")) return;
+    const card = event.target.closest("[data-install]");
+    const item = installs.find((entry) => entry.id === card?.dataset.install);
+    if (!item) return;
+    applyInstallScale(item, Number(event.target.value), false);
+  });
+  document.getElementById("install-list").addEventListener("change", (event) => {
+    if (viewOnly) return;
+    if (!event.target.classList.contains("install-scale")) return;
+    saveStore();
+  });
+  document.getElementById("install-list").addEventListener("click", (event) => {
+    if (viewOnly) return;
+    const button = event.target.closest("[data-act]");
+    if (!button) return;
+    const card = button.closest("[data-install]");
+    const item = installs.find((entry) => entry.id === card?.dataset.install);
+    if (!item) return;
+    if (button.dataset.act === "delete-install") {
+      removeInstall(item.id);
+      return;
+    }
+    if (button.dataset.act === "carry-install") {
+      if (installCarry?.id === item.id) {
+        stopInstallCarry(false);
+        return;
+      }
+      const group = installGroup(item) || spawnInstall(item);
+      if (group) group.visible = false;
+      startInstallCarry(item, event.clientX, event.clientY);
+    }
+  });
+}
+
 function bindDecor() {
   renderCatalog();
   const dialog = document.getElementById("decor-dialog");
   document.getElementById("open-decor-dialog").addEventListener("click", () => {
     if (viewOnly) return;
     document.getElementById("work-dialog").hidden = true;
+    document.getElementById("install-dialog").hidden = true;
     dialog.hidden = false;
   });
   dialog.addEventListener("click", (event) => {
@@ -1992,9 +3366,11 @@ export function setViewOnly(on) {
   if (viewOnly) {
     if (carrying) stopCarry(false);
     if (decorCarry) stopDecorCarry(false);
+    if (installCarry) stopInstallCarry(false);
     if (spotMode) setSpotMode(false);
     document.getElementById("work-dialog").hidden = true;
     document.getElementById("decor-dialog").hidden = true;
+    document.getElementById("install-dialog").hidden = true;
   }
   document.getElementById("show-studio")?.classList.toggle("view-only", viewOnly);
 }
@@ -2012,6 +3388,7 @@ function setSpotMode(on) {
   if (spotMode) {
     if (carrying) stopCarry(false);
     if (decorCarry) stopDecorCarry(false);
+    if (installCarry) stopInstallCarry(false);
     document.querySelector("#show-studio [data-view='3d']")?.click();
   }
   spotModeListener?.(spotMode);
@@ -2031,7 +3408,22 @@ export function initShell(panelGroups) {
     if (obj.userData.isWall) walls.push(obj);
   });
   baseLayout = captureLayout();
-  const stored = loadStore();
+  bindNav();
+  bindShows();
+  bindWorks();
+  bindDecor();
+  bindInstalls();
+  bindSpots();
+  bindGithub();
+  loadSharedStore().then(applyStored);
+}
+
+function applyStored(stored) {
+  if (stored.hold) {
+    setStudio(false);
+    renderShows();
+    return;
+  }
   shows = stored.shows.filter((show) => show && Array.isArray(show.works) && Array.isArray(show.layout));
   activeId = stored.activeId;
   if (stored.legacy) {
@@ -2047,27 +3439,27 @@ export function initShell(panelGroups) {
     activeId = imported.id;
   }
   shows.forEach(normalizeDecorations);
-  bindNav();
-  bindShows();
-  bindWorks();
-  bindDecor();
-  bindSpots();
+  shows.forEach(normalizeInstallations);
   const show = currentShow();
   if (show) {
     works = show.works;
     decors = show.decorations;
+    installs = show.installations;
     applyLayout(show.layout);
     applyMounts();
     mountDecors();
+    mountInstalls();
     publishSpots();
-    if (stored.legacy) saveStore();
+    if (stored.legacy || stored.upload) saveStore();
   } else {
     activeId = null;
     works = [];
     decors = [];
+    installs = [];
   }
   setStudio(false);
   renderShows();
   renderWorks();
   renderDecors();
+  renderInstalls();
 }

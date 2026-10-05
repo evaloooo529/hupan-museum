@@ -19,9 +19,12 @@ import {
   PLAN_IMAGE,
   THICK_BLOCKS,
   TRACKS,
+  WALL_THIN,
+  EXTRA_LIGHT_TRACKS,
+  WALL3_TRACK,
   WALLS,
-} from "./geometry.js?v=light12";
-import { initShell, noteLayoutChanged, artworkFromHit, carryingArtwork, previewCarry, placeCarry, beginArtworkMove, moveArtworkMove, endArtworkMove, carryingDecoration, previewDecor, placeDecor, decorationTargets, decorationFromHit, beginDecorMove, moveDecor, beginDecorScale, scaleDecorMove, endDecorGesture, spotlightEditing, onSpotlightMode, bindSpotLayout, saveSpotPose, setViewOnly } from "./curate.js?v=light14";
+} from "./geometry.js?v=light27";
+import { initShell, noteLayoutChanged, artworkFromHit, carryingArtwork, previewCarry, placeCarry, beginArtworkMove, moveArtworkMove, endArtworkMove, carryingDecoration, previewDecor, placeDecor, decorationTargets, decorationFromHit, beginDecorMove, moveDecor, beginDecorScale, scaleDecorMove, endDecorGesture, carryingInstallation, previewInstall, placeInstall, installationTargets, installationFromHit, beginInstallMove, moveInstall, beginInstallScale, scaleInstallMove, endInstallGesture, spotlightEditing, onSpotlightMode, bindSpotLayout, saveSpotPose, setViewOnly } from "./curate.js?v=light26";
 
 const viewport = document.querySelector("#viewport");
 const viewTag = document.querySelector("#view-tag");
@@ -36,10 +39,12 @@ const hemi = new THREE.HemisphereLight(0xf7f4ee, 0xc5c1b8, 1.4);
 scene.add(hemi);
 const sun = new THREE.DirectionalLight(0xfff6e8, 0.9);
 sun.position.set(6, 18, 8);
+sun.target.position.set(BOUNDS.width / 2, 0, BOUNDS.depth / 2);
+scene.add(sun.target);
 sun.castShadow = true;
 sun.shadow.mapSize.set(2048, 2048);
 sun.shadow.camera.near = 2;
-sun.shadow.camera.far = 48;
+sun.shadow.camera.far = 80;
 sun.shadow.camera.left = -18;
 sun.shadow.camera.right = 18;
 sun.shadow.camera.top = 16;
@@ -64,11 +69,10 @@ const mats = {
     emissiveIntensity: 0.28,
   }),
   track: new THREE.MeshStandardMaterial({
-    color: 0xe0a20f,
-    roughness: 0.45,
-    metalness: 0.05,
+    color: 0x3c4146,
+    roughness: 0.55,
+    metalness: 0.08,
   }),
-  entrance: new THREE.MeshBasicMaterial({ color: 0x5e6368 }),
   panelCream: new THREE.MeshBasicMaterial({ color: 0xf4ecdc, side: THREE.DoubleSide }),
   panelGray: new THREE.MeshBasicMaterial({ color: 0x6a6f74, side: THREE.DoubleSide }),
   panelEdge: new THREE.MeshStandardMaterial({
@@ -97,6 +101,25 @@ const mats = {
     color: 0xf4f7f8,
     roughness: 0.35,
     metalness: 0.15,
+  }),
+  wood: new THREE.MeshStandardMaterial({
+    color: 0xfffdf8,
+    roughness: 0.42,
+    metalness: 0,
+    emissive: 0xfffaf4,
+    emissiveIntensity: 0.42,
+  }),
+  woodPanel: new THREE.MeshStandardMaterial({
+    color: 0xfffdf8,
+    roughness: 0.62,
+    metalness: 0,
+    emissive: 0xfffaf4,
+    emissiveIntensity: 0.48,
+  }),
+  reveal: new THREE.MeshStandardMaterial({
+    color: 0x4e4b47,
+    roughness: 1,
+    metalness: 0,
   }),
   seat: new THREE.MeshStandardMaterial({
     color: 0xc6aa84,
@@ -346,13 +369,152 @@ function tagWallSegment(id, x1, z1, x2, z2, along = 0.5) {
   wallTag(id, mx + nx * 0.55, mz + nz * 0.55);
 }
 
+function wallRun(w) {
+  const dx = Math.abs(w.x2 - w.x1);
+  const dz = Math.abs(w.z2 - w.z1);
+  if (dx >= dz) {
+    return {
+      axis: "x",
+      a1: Math.min(w.x1, w.x2),
+      a2: Math.max(w.x1, w.x2),
+      cross: (w.z1 + w.z2) / 2,
+    };
+  }
+  return {
+    axis: "z",
+    a1: Math.min(w.z1, w.z2),
+    a2: Math.max(w.z1, w.z2),
+    cross: (w.x1 + w.x2) / 2,
+  };
+}
+
+function runEnds(run, a, b) {
+  if (run.axis === "x") return [a, run.cross, b, run.cross];
+  return [run.cross, a, run.cross, b];
+}
+
+/** Side pieces stay walls. The head is not tagged, so the doorway stays walkable. */
+function cutDoorOpening(w, hole1, hole2, head, withLintel = true) {
+  const run = wallRun(w);
+  if (hole1 - run.a1 > 0.02) addSolidWall(...runEnds(run, run.a1, hole1), w.thickness, w.id);
+  if (run.a2 - hole2 > 0.02) addSolidWall(...runEnds(run, hole2, run.a2), w.thickness, w.id);
+  const lintelH = CEILING_HEIGHT - head;
+  if (withLintel && lintelH > 0.02) {
+    const [x1, z1, x2, z2] = runEnds(run, hole1, hole2);
+    gallery.add(wallMesh(x1, z1, x2, z2, w.thickness, lintelH, mats.wall, head));
+  }
+  return run;
+}
+
+/**
+ * Same leaf, frame, gap and head as the north entrance.
+ * Panel and frame materials change; the entrance itself stays glass.
+ */
+function addStyledDoubleDoor(x1, x2, z, panelMat, frameMat) {
+  const width = x2 - x1;
+  const doorH = 2.2;
+  const frame = 0.045;
+  const depth = WALL_THIN;
+  const glassLeaf = panelMat === mats.glass;
+  gallery.add(wallMesh(x1, z, x2, z, depth, CEILING_HEIGHT - doorH, mats.wall, doorH));
+
+  const put = (w, h, d, x, y) => {
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), frameMat);
+    mesh.position.set(x, y, z);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    gallery.add(mesh);
+  };
+
+  const midX = (x1 + x2) / 2;
+  put(frame, doorH, depth + 0.012, x1 + frame / 2, doorH / 2);
+  put(frame, doorH, depth + 0.012, x2 - frame / 2, doorH / 2);
+  put(width, frame, depth + 0.012, midX, doorH - frame / 2);
+  put(width - frame * 2, 0.025, depth + 0.012, midX, 0.012);
+
+  const gap = 0.018;
+  const leafW = (width - frame * 2 - gap) / 2;
+  const glassH = doorH - frame - 0.025;
+  const stile = 0.032;
+  const leaf = (sign) => {
+    const cx = midX + sign * (gap / 2 + leafW / 2);
+    const panel = new THREE.Mesh(
+      new THREE.BoxGeometry(leafW - stile * 2, glassH - 0.06, glassLeaf ? 0.014 : 0.02),
+      panelMat
+    );
+    panel.position.set(cx, 0.025 + glassH / 2, z);
+    if (glassLeaf) panel.renderOrder = 2;
+    else {
+      panel.castShadow = true;
+      panel.receiveShadow = true;
+    }
+    gallery.add(panel);
+    put(stile, glassH, 0.028, cx - sign * (leafW / 2 - stile / 2), 0.025 + glassH / 2);
+    put(stile, glassH, 0.028, cx + sign * (leafW / 2 - stile / 2), 0.025 + glassH / 2);
+    put(leafW, 0.028, 0.028, cx, 0.025 + 0.02);
+    put(leafW, 0.028, 0.028, cx, doorH - frame - 0.02);
+  };
+  leaf(-1);
+  leaf(1);
+}
+
+function addDoubleWoodDoorWall(w) {
+  const xLo = Math.min(w.x1, w.x2);
+  const xHi = Math.max(w.x1, w.x2);
+  const z = (w.z1 + w.z2) / 2;
+  const width = ENTRANCE.width;
+  const mid = (xLo + xHi) / 2;
+  const x1 = mid - width / 2;
+  const x2 = mid + width / 2;
+  cutDoorOpening(w, x1, x2, 2.2, false);
+  addStyledDoubleDoor(x1, x2, z, mats.woodPanel, mats.wood);
+}
+
+/** Single flush leaf, same white as the wall, with a hairline shadow gap. */
+function addConcealedDoorWall(w) {
+  const width = 0.9;
+  const head = 2.2;
+  const run = wallRun(w);
+  const mid = (run.a1 + run.a2) / 2;
+  const hole1 = mid - width / 2;
+  const hole2 = mid + width / 2;
+  cutDoorOpening(w, hole1, hole2, head);
+  const reveal = 0.016;
+  const under = 0.008;
+  const leafAlong = width - reveal * 2;
+  const leafH = head - reveal - under;
+  const place = (mesh, along, y, cross) => {
+    if (run.axis === "x") mesh.position.set(along, y, cross);
+    else mesh.position.set(cross, y, along);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    gallery.add(mesh);
+  };
+  const shadow = new THREE.Mesh(
+    run.axis === "x"
+      ? new THREE.BoxGeometry(width - 0.004, head - 0.004, 0.02)
+      : new THREE.BoxGeometry(0.02, head - 0.004, width - 0.004),
+    mats.reveal
+  );
+  place(shadow, mid, (head - 0.004) / 2, run.cross);
+  const leaf = new THREE.Mesh(
+    run.axis === "x"
+      ? new THREE.BoxGeometry(leafAlong, leafH, w.thickness)
+      : new THREE.BoxGeometry(w.thickness, leafH, leafAlong),
+    mats.wall
+  );
+  place(leaf, mid, under + leafH / 2, run.cross);
+}
+
 function addWalls() {
   for (const w of WALLS) {
-    if (w.opening) addWallWithOpening(w);
+    if (w.id === 7) addDoubleWoodDoorWall(w);
+    else if (w.id === 4) addConcealedDoorWall(w);
+    else if (w.opening) addWallWithOpening(w);
     else if (w.face === "south") addFloorToCeilingGlass(w.x1, w.z1, w.x2, w.z2, w.thickness, w.id);
     else if (w.face === "east") addEastFacade(w);
     else addSolidWall(w.x1, w.z1, w.x2, w.z2, w.thickness, w.id);
-    const along = w.id === 1 ? 0.28 : 0.5;
+    const along = w.id === 1 ? 0.28 : w.id === 8 ? 0.72 : w.id === 7 ? 0.14 : w.id === 4 ? 0.16 : 0.5;
     tagWallSegment(w.id, w.x1, w.z1, w.x2, w.z2, along);
   }
   addEastBench();
@@ -401,19 +563,18 @@ function addTracks() {
   const rails = [];
   for (const r of TRACKS.xRails) rails.push([r.x, r.z1, r.x, r.z2]);
   for (const r of TRACKS.zRails) rails.push([r.x1, r.z, r.x2, r.z]);
+  rails.push([WALL3_TRACK.x1, WALL3_TRACK.z, WALL3_TRACK.x2, WALL3_TRACK.z]);
   for (const seg of rails) addDashedSegment(seg[0], seg[1], seg[2], seg[3], y, mats.track, 0.06, 0.26, 0.16, trackGroup);
   addLightTracks();
   gallery.add(trackGroup);
 }
 
 const lightTrackMat = new THREE.MeshStandardMaterial({ color: 0x1a1a1a, roughness: 0.62, metalness: 0.2 });
-const spotBodyMat = new THREE.MeshStandardMaterial({ color: 0x161616, roughness: 0.42, metalness: 0.62 });
-const spotLensMat = new THREE.MeshStandardMaterial({
-  color: 0xfff4df,
-  emissive: 0xffe2b0,
-  emissiveIntensity: 0.85,
-  roughness: 0.28,
-});
+const whiteLightTrackMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+const spotBodyMat = new THREE.MeshBasicMaterial({ color: 0x161616 });
+const spotLensMat = new THREE.MeshBasicMaterial({ color: 0xfff4df });
+const whiteSpotBodyMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+const whiteSpotLensMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
 const SPOT_ANGLE = 0.4;
 const SPOT_PITCH = 0.42;
 const spotLights = [];
@@ -486,22 +647,24 @@ function pointsOnLoop(rect, count) {
   return points;
 }
 
-function addMuseumSpot(x, z, aimX, aimZ) {
+function addMuseumSpot(x, z, aimX, aimZ, finish = {}) {
+  const bodyMat = finish.body || spotBodyMat;
+  const lensMaterial = finish.lens || spotLensMat;
   const group = new THREE.Group();
   group.position.set(x, CEILING_HEIGHT - 0.06, z);
   const yaw = Math.atan2(aimX - x, aimZ - z);
   group.rotation.y = yaw;
-  const clamp = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.035, 0.07), spotBodyMat);
+  const clamp = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.035, 0.07), bodyMat);
   group.add(clamp);
   const pivot = new THREE.Group();
   pivot.rotation.x = SPOT_PITCH;
   group.add(pivot);
-  const head = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.055, 0.14, 14), spotBodyMat);
+  const head = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.055, 0.14, 14), bodyMat);
   head.rotation.x = Math.PI / 2;
   head.position.set(0, 0, 0.08);
   head.castShadow = false;
   pivot.add(head);
-  const lens = new THREE.Mesh(new THREE.CircleGeometry(0.038, 14), spotLensMat);
+  const lens = new THREE.Mesh(new THREE.CircleGeometry(0.038, 14), lensMaterial);
   lens.position.set(0, 0, 0.15);
   pivot.add(lens);
   const spot = new THREE.SpotLight(0xfff1d2, 0, 14, SPOT_ANGLE, 0.62, 2);
@@ -514,6 +677,7 @@ function addMuseumSpot(x, z, aimX, aimZ) {
   spot.target = target;
   const pool = new THREE.Mesh(spotPoolGeo, spotPoolMat);
   pool.visible = false;
+  pool.raycast = () => {};
   pool.renderOrder = 4;
   gallery.add(pool);
   const pick = new THREE.Mesh(new THREE.SphereGeometry(0.22, 12, 10), spotPickMat);
@@ -555,16 +719,48 @@ function snapToLightTrack(x, z) {
   return { x: bestX, z: bestZ };
 }
 
+function setCeilingForPerson(on) {
+  if (on) {
+    mats.ceiling.color.set(0x000000);
+    mats.ceiling.opacity = 1;
+    mats.ceiling.transparent = false;
+    mats.ceiling.depthWrite = true;
+  } else {
+    mats.ceiling.color.set(0xfbfaf6);
+    mats.ceiling.opacity = 0.16;
+    mats.ceiling.transparent = true;
+    mats.ceiling.depthWrite = false;
+  }
+  mats.ceiling.needsUpdate = true;
+  ceilingGroup.traverse((obj) => {
+    if (obj.isMesh) obj.castShadow = false;
+  });
+}
+
+function viewingSpots() {
+  return spotlightEditing() || (mode === "fp" && fpSpotsOn);
+}
+
+function syncFpSpots() {
+  const btn = document.getElementById("fp-spots");
+  if (btn) {
+    btn.hidden = mode !== "fp";
+    btn.textContent = fpSpotsOn ? "射灯 开" : "射灯 关";
+    btn.setAttribute("aria-pressed", fpSpotsOn ? "true" : "false");
+    btn.classList.toggle("on", fpSpotsOn);
+  }
+  if (!spotlightEditing()) setSpotLights(mode === "fp" && fpSpotsOn);
+}
+
 function updateSpotBeams() {
-  const showBeams = spotlightEditing();
+  if (!viewingSpots()) {
+    for (const group of spotFixtures) group.userData.pool.visible = false;
+    return;
+  }
   gallery.updateMatrixWorld(true);
   for (const group of spotFixtures) {
     const pivot = group.userData.pivot;
     const pool = group.userData.pool;
-    if (!showBeams) {
-      pool.visible = false;
-      continue;
-    }
     beamOrigin.set(0, 0, 0.08).applyMatrix4(pivot.matrixWorld);
     beamDir.set(0, 0, 1).transformDirection(pivot.matrixWorld);
     beamRay.set(beamOrigin, beamDir);
@@ -629,7 +825,10 @@ function setSpotPicks(on) {
 }
 
 function setSpotLights(on) {
-  for (const spot of spotLights) spot.intensity = on ? 24 : 0;
+  for (const spot of spotLights) {
+    spot.visible = on;
+    spot.intensity = on ? 24 : 0;
+  }
 }
 
 function addLightTracks() {
@@ -652,21 +851,26 @@ function addLightTracks() {
       for (const [x, z] of pointsOnLoop(inner, 5)) addMuseumSpot(x, z, x + (x - inner.cx), z + (z - inner.cz));
     }
   }
+  addExtraLightTracks();
+}
+
+function addExtraLightTracks() {
+  const y = CEILING_HEIGHT - 0.055;
+  const finish = { body: whiteSpotBodyMat, lens: whiteSpotLensMat };
+  for (const rail of EXTRA_LIGHT_TRACKS) {
+    addDashedSegment(rail.x1, rail.z1, rail.x2, rail.z2, y, whiteLightTrackMat, 0.045, 0.2, 0.13, trackGroup);
+    lightTrackSegments.push({ x1: rail.x1, z1: rail.z1, x2: rail.x2, z2: rail.z2 });
+    for (let i = 0; i < 4; i += 1) {
+      const t = (i + 0.5) / 4;
+      const x = rail.x1 + (rail.x2 - rail.x1) * t;
+      const z = rail.z1 + (rail.z2 - rail.z1) * t;
+      addMuseumSpot(x, z, x + rail.aimX, z + rail.aimZ, finish);
+    }
+  }
 }
 
 function addEntrance() {
-  addDashedSegment(
-    ENTRANCE.x1,
-    ENTRANCE.z,
-    ENTRANCE.x2,
-    ENTRANCE.z,
-    0.04,
-    mats.entrance,
-    0.05,
-    0.16,
-    0.1,
-    gallery
-  );
+  addStyledDoubleDoor(ENTRANCE.x1, ENTRANCE.x2, ENTRANCE.z, mats.glass, mats.frame);
 }
 
 const ceilingGroup = new THREE.Group();
@@ -679,9 +883,15 @@ function addCeiling() {
     else shape.lineTo(x, -z);
   });
   shape.closePath();
-  const mesh = new THREE.Mesh(new THREE.ShapeGeometry(shape), mats.ceiling);
+  const slab = 0.2;
+  const mesh = new THREE.Mesh(
+    new THREE.ExtrudeGeometry(shape, { depth: slab, bevelEnabled: false }),
+    mats.ceiling
+  );
   mesh.rotation.x = -Math.PI / 2;
   mesh.position.y = CEILING_HEIGHT;
+  mesh.castShadow = false;
+  mesh.receiveShadow = false;
   ceilingGroup.add(mesh);
   gallery.add(ceilingGroup);
 }
@@ -756,6 +966,7 @@ function railSegments() {
   const segs = [];
   for (const r of TRACKS.xRails) segs.push({ x1: r.x, z1: r.z1, x2: r.x, z2: r.z2 });
   for (const r of TRACKS.zRails) segs.push({ x1: r.x1, z1: r.z, x2: r.x2, z2: r.z });
+  segs.push({ x1: WALL3_TRACK.x1, z1: WALL3_TRACK.z, x2: WALL3_TRACK.x2, z2: WALL3_TRACK.z });
   return segs;
 }
 
@@ -991,13 +1202,15 @@ const persp = new THREE.PerspectiveCamera(42, 1, 0.08, 120);
 const ortho = new THREE.OrthographicCamera(-10, 10, 8, -8, 0.1, 80);
 let mode = "top";
 const EYE = 1.6;
-const FP_FOV = 68;
+let fpFov = 68;
 let fpStanding = false;
 let fpX = BOUNDS.width / 2;
 let fpZ = BOUNDS.depth / 2;
 let fpYaw = 0;
 let fpPitch = 0;
 let fpLook = null;
+let fpClick = null;
+let fpSpotsOn = false;
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -1019,6 +1232,28 @@ function markView(name) {
       btn.classList.toggle("active", kind === name);
     });
   }
+}
+
+const GALLERY_LIGHT = {
+  sky: 0xf7f4ee,
+  ground: 0xc5c1b8,
+  hemi: 1.4,
+  sun: 0xfff6e8,
+  intensity: 0.9,
+  position: [6, 18, 8],
+  background: 0xe6e1d6,
+};
+
+function restoreGalleryLight() {
+  hemi.color.set(GALLERY_LIGHT.sky);
+  hemi.groundColor.set(GALLERY_LIGHT.ground);
+  hemi.intensity = GALLERY_LIGHT.hemi;
+  mats.wall.emissiveIntensity = 0.28;
+  sun.color.set(GALLERY_LIGHT.sun);
+  sun.intensity = GALLERY_LIGHT.intensity;
+  sun.position.set(...GALLERY_LIGHT.position);
+  sun.target.position.set(BOUNDS.width / 2, 0, BOUNDS.depth / 2);
+  scene.background.set(GALLERY_LIGHT.background);
 }
 
 function placeOverhead() {
@@ -1055,7 +1290,7 @@ function fitTop() {
   fpStanding = false;
   setViewOnly(false);
   placeOverhead();
-  viewTag.textContent = "俯视平面 · 上为南";
+  viewTag.textContent = "俯视平面";
   wallTagGroup.visible = true;
   dimGroup.visible = document.getElementById("tog-dims").checked;
   compass.hidden = false;
@@ -1063,6 +1298,10 @@ function fitTop() {
   document.querySelector(".scale").hidden = false;
   renderer.domElement.style.cursor = "";
   markView("top");
+  setCeilingForPerson(false);
+  syncFpSpots();
+  syncShotButton();
+  restoreGalleryLight();
 }
 
 function fit3d() {
@@ -1102,10 +1341,14 @@ function fit3d() {
   document.querySelector(".scale").hidden = false;
   renderer.domElement.style.cursor = "";
   markView("3d");
+  setCeilingForPerson(false);
+  syncFpSpots();
+  syncShotButton();
+  restoreGalleryLight();
 }
 
 function applyFpLook() {
-  persp.fov = FP_FOV;
+  persp.fov = fpFov;
   persp.up.set(0, 1, 0);
   persp.rotation.order = "YXZ";
   persp.position.set(fpX, EYE, fpZ);
@@ -1117,10 +1360,11 @@ function fitFp() {
   mode = "fp";
   fpStanding = false;
   fpLook = null;
+  fpClick = null;
   setViewOnly(true);
   placeOverhead();
   controls.enabled = false;
-  viewTag.textContent = "第一人称 · 点击馆内地面站进去";
+  viewTag.textContent = "第一人称 · 左键点击地面站进去";
   wallTagGroup.visible = true;
   dimGroup.visible = document.getElementById("tog-dims").checked;
   compass.hidden = false;
@@ -1128,6 +1372,10 @@ function fitFp() {
   document.querySelector(".scale").hidden = false;
   renderer.domElement.style.cursor = "crosshair";
   markView("fp");
+  setCeilingForPerson(false);
+  syncFpSpots();
+  syncShotButton();
+  restoreGalleryLight();
 }
 
 function pixelsPerMeter() {
@@ -1165,6 +1413,10 @@ function resize() {
 
 window.addEventListener("resize", resize);
 
+document.querySelector("[data-section='space']").addEventListener("click", () => {
+  fitTop();
+  resize();
+});
 document.querySelectorAll("[data-view='top']").forEach((btn) => {
   btn.addEventListener("click", () => {
     fitTop();
@@ -1183,6 +1435,47 @@ document.querySelectorAll("[data-view='fp']").forEach((btn) => {
     resize();
   });
 });
+document.getElementById("fp-spots").addEventListener("click", () => {
+  fpSpotsOn = !fpSpotsOn;
+  syncFpSpots();
+});
+
+function syncShotButton() {
+  const btn = document.getElementById("shot");
+  if (btn) btn.hidden = mode !== "3d" && mode !== "fp";
+}
+
+function saveViewShot() {
+  const cam = activeCamera();
+  renderer.render(scene, cam);
+  const gl = renderer.getContext();
+  const w = gl.drawingBufferWidth;
+  const h = gl.drawingBufferHeight;
+  const pixels = new Uint8Array(w * h * 4);
+  gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const image = canvas.getContext("2d").createImageData(w, h);
+  const row = w * 4;
+  for (let y = 0; y < h; y += 1) {
+    image.data.set(pixels.subarray((h - 1 - y) * row, (h - y) * row), y * row);
+  }
+  canvas.getContext("2d").putImageData(image, 0, 0);
+  canvas.toBlob((blob) => {
+    if (!blob) return;
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    const now = new Date();
+    const pad = (n) => String(n).padStart(2, "0");
+    link.download = `湖畔美术馆-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}.png`;
+    link.href = url;
+    link.click();
+    URL.revokeObjectURL(url);
+  }, "image/png");
+}
+
+document.getElementById("shot").addEventListener("click", saveViewShot);
 document.getElementById("tog-plan").addEventListener("change", (e) => {
   const show = e.target.checked && (mode === "top" || (mode === "fp" && !fpStanding));
   planOverlay.visible = show;
@@ -1208,6 +1501,9 @@ let movingArt = false;
 let movingDecor = false;
 let scalingDecor = false;
 let rotatingDecor = null;
+let movingInstall = false;
+let scalingInstall = false;
+let rotatingInstall = null;
 let movingSpot = null;
 let rotatingSpot = null;
 const ceilingPoint = new THREE.Vector3();
@@ -1218,6 +1514,8 @@ let rotateStart = 0;
 let rotatePitchStart = 0;
 let rotateClientX = 0;
 let rotateClientY = 0;
+let pointerStart = 0;
+let angleSnapHeld = false;
 function standBlocked(x, z) {
   const margin = 0.22;
   const local = new THREE.Vector3();
@@ -1262,8 +1560,11 @@ function standAt(x, z) {
   document.querySelector(".scale").hidden = true;
   controls.enabled = false;
   applyFpLook();
-  viewTag.textContent = "第一人称 · 拖动环顾，点击地面走动";
-  renderer.domElement.style.cursor = "grab";
+  viewTag.textContent = "第一人称 · 左键换位置，右键环顾，滚轮调视野";
+  renderer.domElement.style.cursor = "crosshair";
+  setCeilingForPerson(true);
+  syncFpSpots();
+  restoreGalleryLight();
 }
 
 function floorStandPoint() {
@@ -1303,6 +1604,33 @@ function panelFromHit(intersections) {
     }
   }
   return null;
+}
+
+const panelPickLocal = new THREE.Vector3();
+
+function panelNearPoint(point, maxDist) {
+  if (!point) return null;
+  let best = null;
+  let bestD = maxDist;
+  for (const panel of panelGroups) {
+    panelPickLocal.set(point.x, 0, point.z);
+    panel.worldToLocal(panelPickLocal);
+    const limit = PANEL_WIDTH / 2;
+    const along = Math.max(-limit, Math.min(limit, panelPickLocal.z));
+    const dist = Math.hypot(panelPickLocal.x, panelPickLocal.z - along);
+    if (dist < bestD) {
+      bestD = dist;
+      best = panel;
+    }
+  }
+  return best;
+}
+
+function takePointer(event) {
+  controls.enabled = false;
+  try { renderer.domElement.setPointerCapture(event.pointerId); } catch (err) { /* pointer already gone */ }
+  event.preventDefault();
+  event.stopPropagation();
 }
 
 function pointOnFloor() {
@@ -1353,15 +1681,40 @@ function hitDistance(intersections, predicate) {
   return Infinity;
 }
 
+function gestureDistances(hits, decorHit) {
+  return {
+    art: hitDistance(hits, (node) => node.userData.isArtwork),
+    panel: hitDistance(hits, (node) => node.userData.isPanel),
+    decor: decorHit ? decorHit.distance : Infinity,
+  };
+}
+
 renderer.domElement.addEventListener("contextmenu", (event) => event.preventDefault());
+
+renderer.domElement.addEventListener("wheel", (event) => {
+  if (mode !== "fp" || !fpStanding) return;
+  event.preventDefault();
+  const dir = Math.sign(event.deltaY);
+  if (!dir) return;
+  fpFov = THREE.MathUtils.clamp(fpFov + dir * 3, 40, 90);
+  applyFpLook();
+}, { passive: false });
 
 renderer.domElement.addEventListener("pointerdown", (event) => {
   if (mode === "fp") {
+    if (event.button === 2 && fpStanding) {
+      fpLook = { x: event.clientX, y: event.clientY, yaw: fpYaw, pitch: fpPitch };
+      controls.enabled = false;
+      renderer.domElement.style.cursor = "grabbing";
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
     if (event.button !== 0) return;
     setPointer(event);
-    fpLook = { x: event.clientX, y: event.clientY, yaw: fpYaw, pitch: fpPitch, moved: false };
+    fpClick = { x: event.clientX, y: event.clientY };
     controls.enabled = false;
-    renderer.domElement.style.cursor = fpStanding ? "grabbing" : "crosshair";
+    renderer.domElement.style.cursor = "crosshair";
     event.preventDefault();
     event.stopPropagation();
     return;
@@ -1379,18 +1732,14 @@ renderer.domElement.addEventListener("pointerdown", (event) => {
       rotatePitchStart = spot.userData.pivot.rotation.x;
       rotateClientX = event.clientX;
       rotateClientY = event.clientY;
-      controls.enabled = false;
-      try { renderer.domElement.setPointerCapture(event.pointerId); } catch (err) { /* pointer already gone */ }
       renderer.domElement.style.cursor = "crosshair";
-      event.preventDefault();
+      takePointer(event);
       return;
     }
     if (spot && point && event.button === 0) {
       movingSpot = spot;
-      controls.enabled = false;
-      try { renderer.domElement.setPointerCapture(event.pointerId); } catch (err) { /* pointer already gone */ }
       renderer.domElement.style.cursor = "grabbing";
-      event.preventDefault();
+      takePointer(event);
       return;
     }
     return;
@@ -1411,57 +1760,67 @@ renderer.domElement.addEventListener("pointerdown", (event) => {
     }
     return;
   }
+  if (event.button === 0 && carryingInstallation()) {
+    previewInstall(pointOnFloor(), event.clientX, event.clientY);
+    if (placeInstall()) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+    return;
+  }
   const hits = sceneHits();
   const decorHit = decorationFromHit(raycaster.intersectObjects(decorationTargets(), true));
+  const installHit = installationFromHit(raycaster.intersectObjects(installationTargets(), true));
   const artwork = artworkFromHit(hits);
-  const artDistance = artwork ? hitDistance(hits, (node) => node.userData.isArtwork) : Infinity;
-  if (decorHit && decorHit.distance <= artDistance) {
+  const dist = gestureDistances(hits, decorHit);
+  const installDist = installHit ? installHit.distance : Infinity;
+  const floorHit = installHit && installDist <= dist.decor ? installHit : decorHit;
+  const floorDist = floorHit ? (floorHit === installHit ? installDist : dist.decor) : Infinity;
+  const floorKind = floorHit && floorHit === installHit ? "install" : "decor";
+  if (floorHit && floorDist <= dist.art && floorDist < dist.panel) {
     const point = pointOnFloor();
-    if (event.button === 0 && point && (decorHit.handle || event.shiftKey) && beginDecorScale(decorHit.group, point)) {
-      scalingDecor = true;
-      controls.enabled = false;
-      try { renderer.domElement.setPointerCapture(event.pointerId); } catch (err) { /* pointer already gone */ }
+    const beginScale = floorKind === "install" ? beginInstallScale : beginDecorScale;
+    const beginMove = floorKind === "install" ? beginInstallMove : beginDecorMove;
+    if (event.button === 0 && point && (floorHit.handle || event.shiftKey) && beginScale(floorHit.group, point)) {
+      if (floorKind === "install") scalingInstall = true;
+      else scalingDecor = true;
       renderer.domElement.style.cursor = "nesw-resize";
-      event.preventDefault();
+      takePointer(event);
       return;
     }
     if (event.button === 2 || event.altKey) {
-      if (point && beginDecorMove(decorHit.group)) {
-        rotatingDecor = decorHit.group;
-        rotateStart = decorHit.group.rotation.y;
+      if (point && beginMove(floorHit.group)) {
+        if (floorKind === "install") rotatingInstall = floorHit.group;
+        else rotatingDecor = floorHit.group;
+        rotateStart = floorHit.group.rotation.y;
         rotateClientX = event.clientX;
-        controls.enabled = false;
-        try { renderer.domElement.setPointerCapture(event.pointerId); } catch (err) { /* pointer already gone */ }
         renderer.domElement.style.cursor = "crosshair";
-        event.preventDefault();
+        takePointer(event);
       }
       return;
     }
-    if (event.button === 0 && beginDecorMove(decorHit.group)) {
-      movingDecor = true;
-      dragOffsetX = decorHit.group.position.x - (point ? point.x : decorHit.group.position.x);
-      dragOffsetZ = decorHit.group.position.z - (point ? point.z : decorHit.group.position.z);
-      controls.enabled = false;
-      try { renderer.domElement.setPointerCapture(event.pointerId); } catch (err) { /* pointer already gone */ }
+    if (event.button === 0 && beginMove(floorHit.group)) {
+      if (floorKind === "install") movingInstall = true;
+      else movingDecor = true;
+      dragOffsetX = floorHit.group.position.x - (point ? point.x : floorHit.group.position.x);
+      dragOffsetZ = floorHit.group.position.z - (point ? point.z : floorHit.group.position.z);
       renderer.domElement.style.cursor = "grabbing";
-      event.preventDefault();
+      takePointer(event);
       return;
     }
   }
-  if (artwork && !artwork.userData.fixed && event.button === 0 && !event.altKey) {
+  if (artwork && !artwork.userData.fixed && event.button === 0 && !event.altKey && dist.art < dist.panel && dist.art <= dist.decor && dist.art <= installDist) {
     if (beginArtworkMove(artwork)) {
       movingArt = true;
-      controls.enabled = false;
-      try { renderer.domElement.setPointerCapture(event.pointerId); } catch (err) { /* pointer already gone */ }
       renderer.domElement.style.cursor = "grabbing";
-      event.preventDefault();
+      takePointer(event);
       return;
     }
   }
-  const panel = panelFromHit(hits);
-  if (!panel) return;
   const point = pointOnFloor();
-  if (!point) return;
+  let panel = panelFromHit(hits);
+  if (!panel && event.button === 0) panel = panelNearPoint(point, 0.9);
+  if (!panel || !point) return;
   angleSnapHeld = false;
   if (event.button === 2 || event.altKey) {
     rotating = panel;
@@ -1474,19 +1833,14 @@ renderer.domElement.addEventListener("pointerdown", (event) => {
     dragOffsetZ = panel.position.z - point.z;
     renderer.domElement.style.cursor = "grabbing";
   }
-  controls.enabled = false;
-  renderer.domElement.setPointerCapture(event.pointerId);
-  event.preventDefault();
+  takePointer(event);
 }, true);
 
 renderer.domElement.addEventListener("pointermove", (event) => {
   if (mode === "fp") {
-    if (!fpLook) return;
+    if (!fpLook || !fpStanding) return;
     const dx = event.clientX - fpLook.x;
     const dy = event.clientY - fpLook.y;
-    if (!fpLook.moved && Math.hypot(dx, dy) < 5) return;
-    fpLook.moved = true;
-    if (!fpStanding) return;
     fpYaw = fpLook.yaw - dx * 0.007;
     fpPitch = Math.min(1.15, Math.max(-1.15, fpLook.pitch - dy * 0.005));
     applyFpLook();
@@ -1528,6 +1882,25 @@ renderer.domElement.addEventListener("pointermove", (event) => {
     renderer.domElement.style.cursor = "none";
     return;
   }
+  if (carryingInstallation()) {
+    previewInstall(pointOnFloor(), event.clientX, event.clientY);
+    renderer.domElement.style.cursor = "none";
+    return;
+  }
+  if (scalingInstall) {
+    const point = pointOnFloor();
+    if (point) scaleInstallMove(point.x, point.z);
+    return;
+  }
+  if (movingInstall) {
+    const point = pointOnFloor();
+    if (point) moveInstall(point.x + dragOffsetX, point.z + dragOffsetZ);
+    return;
+  }
+  if (rotatingInstall) {
+    rotatingInstall.rotation.y = rotateStart - (event.clientX - rotateClientX) * 0.015;
+    return;
+  }
   if (scalingDecor) {
     const point = pointOnFloor();
     if (point) scaleDecorMove(point.x, point.z);
@@ -1562,18 +1935,22 @@ renderer.domElement.addEventListener("pointermove", (event) => {
     raycaster.setFromCamera(pointer, activeCamera());
     const hits = sceneHits();
     const decorHover = decorationFromHit(raycaster.intersectObjects(decorationTargets(), true));
+    const installHover = installationFromHit(raycaster.intersectObjects(installationTargets(), true));
     const art = artworkFromHit(hits);
-    const artDistance = art ? hitDistance(hits, (node) => node.userData.isArtwork) : Infinity;
-    if (decorHover && decorHover.distance <= artDistance) {
-      renderer.domElement.style.cursor = decorHover.handle || event.shiftKey ? "nesw-resize" : "move";
+    const dist = gestureDistances(hits, decorHover);
+    const installDist = installHover ? installHover.distance : Infinity;
+    const floorHover = installHover && installDist <= dist.decor ? installHover : decorHover;
+    const floorDist = floorHover ? (floorHover === installHover ? installDist : dist.decor) : Infinity;
+    if (floorHover && floorDist <= dist.art && floorDist < dist.panel) {
+      renderer.domElement.style.cursor = floorHover.handle || event.shiftKey ? "nesw-resize" : "move";
       return;
     }
-    if (art && !art.userData.fixed) {
+    if (art && !art.userData.fixed && dist.art < dist.panel && dist.art <= dist.decor && dist.art <= installDist) {
       renderer.domElement.style.cursor = "move";
       return;
     }
-    const hover = panelFromHit(hits);
-    renderer.domElement.style.cursor = hover ? (event.altKey ? "crosshair" : "grab") : "";
+    const hover = panelFromHit(hits) || panelNearPoint(pointOnFloor(), 0.9);
+    renderer.domElement.style.cursor = hover ? (event.altKey || event.buttons === 2 ? "crosshair" : "grab") : "";
     return;
   }
   const point = pointOnFloor();
@@ -1593,24 +1970,29 @@ renderer.domElement.addEventListener("pointermove", (event) => {
 
 function endDrag(event) {
   if (mode === "fp") {
-    const look = fpLook;
+    const click = fpClick;
+    fpClick = null;
     fpLook = null;
-    if (look && !look.moved && event?.button === 0) {
+    if (event?.button === 0 && click && Math.hypot(event.clientX - click.x, event.clientY - click.y) < 6) {
       setPointer(event);
       const spot = floorStandPoint();
       if (spot) standAt(spot.x, spot.z);
     }
-    renderer.domElement.style.cursor = fpStanding ? "grab" : "crosshair";
+    renderer.domElement.style.cursor = "crosshair";
     controls.enabled = false;
     return;
   }
   const movedArt = movingArt;
   const movedDecor = movingDecor || scalingDecor || rotatingDecor;
+  const movedInstall = movingInstall || scalingInstall || rotatingInstall;
   const spotGesture = movingSpot || rotatingSpot;
   movingArt = false;
   movingDecor = false;
   scalingDecor = false;
   rotatingDecor = null;
+  movingInstall = false;
+  scalingInstall = false;
+  rotatingInstall = null;
   movingSpot = null;
   rotatingSpot = null;
   if (spotGesture) {
@@ -1624,6 +2006,7 @@ function endDrag(event) {
   }
   if (movedArt) endArtworkMove();
   if (movedDecor) endDecorGesture();
+  if (movedInstall) endInstallGesture();
   const moved = Boolean(dragging || rotating);
   dragging = null;
   rotating = null;
