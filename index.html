@@ -223,13 +223,13 @@
       <form id="github-form">
         <h1>连接 GitHub</h1>
         <p>粘贴一个可以读写私有仓库 <strong>hupan-museum-shows</strong> 的 GitHub 令牌。它只保存在这台设备的浏览器里，用来在不同设备之间同步同一份策展。</p>
-        <p><a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noreferrer">在 GitHub 新建一个细粒度令牌</a>，只勾选仓库 hupan-museum-shows，权限里勾选 Contents（内容），级别选 Read and write。</p>
+        <p><a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noreferrer">在 GitHub 新建一个细粒度令牌</a>。仓库只勾选 <strong>hupan-museum-shows</strong>；权限里找到 <strong>Contents</strong>（内容），级别选 <strong>Read and write</strong>；有效期尽量选一年或不过期，过期后就要重新贴一次。</p>
         <label>令牌<input name="token" type="password" autocomplete="off" required placeholder="github_pat_…" /></label>
         <label id="github-repo-label">仓库<input name="repo" placeholder="用户名/hupan-museum-shows" /></label>
         <p id="github-gate-msg"></p>
         <button class="primary" type="submit">连接</button>
       </form>
     </div>
-    <script type="module" src="./src/main.js?v=light61"></script>
+    <script type="module" src="./src/main.js?v=light62"></script>
   </body>
 </html>

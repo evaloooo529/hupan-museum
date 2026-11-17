@@ -78,6 +78,9 @@ const GH_KEY = "school-art-museum-github";
 const GH_PATH = "data/shows.json";
 const GH_CONTENTS_LIMIT = 900000;
 
+let knownShowIds = new Set();
+let saveChain = Promise.resolve();
+
 function dataRepoName() {
   const meta = document.querySelector('meta[name="gallery-data-repo"]')?.content?.trim() || "";
   if (meta.includes("/")) return meta;
@@ -90,6 +93,22 @@ function dataRepoName() {
   return "";
 }
 
+function cleanToken(value) {
+  return String(value || "")
+    .replace(/[\s\u200b\u200c\u200d\ufeff]/g, "")
+    .replace(/^Bearer/i, "");
+}
+
+function rememberGithub(partial) {
+  const current = githubConfig() || {};
+  const next = {
+    token: partial.token || current.token,
+    repo: partial.repo || `${current.owner}/${current.repo}`,
+    branch: partial.branch || current.branch,
+  };
+  localStorage.setItem(GH_KEY, JSON.stringify(next));
+}
+
 function githubConfig() {
   let saved = null;
   try {
@@ -98,8 +117,9 @@ function githubConfig() {
     saved = null;
   }
   const [owner, repo] = dataRepoName().split("/");
-  if (!saved?.token || !owner || !repo) return null;
-  return { token: saved.token, owner, repo, branch: saved.branch || "main" };
+  const token = cleanToken(saved?.token);
+  if (!token || !owner || !repo) return null;
+  return { token, owner, repo, branch: saved.branch || "" };
 }
 
 function hostedOnGithub() {
@@ -122,20 +142,52 @@ function showGithubGate(message) {
   gate.hidden = false;
 }
 
+function githubFault(res, body) {
+  const detail = body?.message || "";
+  const err = new Error("github");
+  err.status = res.status;
+  err.detail = detail;
+  if (res.status === 401) err.code = "bad";
+  else if (res.status === 403 && /rate limit/i.test(detail)) err.code = "rate";
+  else if (res.status === 403 && /too large|too_large/i.test(detail)) err.code = "large";
+  else if (res.status === 403) err.code = "perm";
+  else if (res.status === 404) err.code = "missing";
+  else err.code = "fail";
+  return err;
+}
+
+function explainGithub(err) {
+  if (err?.code === "bad") return "令牌无效或已过期。细粒度令牌常常只有几十天，请新建一个，有效期尽量选一年或不过期。";
+  if (err?.code === "perm") return "令牌权限不够。请只勾选仓库 hupan-museum-shows，并把 Contents（内容）设为 Read and write。";
+  if (err?.code === "missing") return "这个令牌看不到私有仓库 hupan-museum-shows。请确认授权的是这个私有仓库，而不是公开的网站仓库。";
+  if (err?.code === "rate") return "GitHub 暂时限制了请求次数，请等一两分钟再连。";
+  if (err?.detail) return `没能同步策展存档：${err.detail}`;
+  return "没能同步策展存档，请再试一次。";
+}
+
+function githubHeaders(extra = {}) {
+  const cfg = githubConfig();
+  return {
+    Authorization: `Bearer ${cfg.token}`,
+    "X-GitHub-Api-Version": "2022-11-28",
+    ...extra,
+  };
+}
+
 async function githubRequest(path, options = {}) {
   const cfg = githubConfig();
   if (!cfg) {
-    const err = new Error("auth");
+    const err = githubFault({ status: 401 }, { message: "Bad credentials" });
     throw err;
   }
+  const allowed = options.allowStatuses || [];
   const res = await fetch(`https://api.github.com${path}`, {
+    cache: "no-store",
     ...options,
-    headers: {
+    headers: githubHeaders({
       Accept: "application/vnd.github+json",
-      Authorization: `Bearer ${cfg.token}`,
-      "X-GitHub-Api-Version": "2022-11-28",
       ...(options.headers || {}),
-    },
+    }),
   });
   const text = await res.text();
   let body = null;
@@ -144,12 +196,8 @@ async function githubRequest(path, options = {}) {
   } catch {
     body = { message: text };
   }
-  const message = body?.message || "";
-  if (res.status === 401 || (res.status === 403 && /credential|token|resource not accessible/i.test(message))) {
-    const err = new Error("auth");
-    err.status = res.status;
-    throw err;
-  }
+  if (allowed.includes(res.status)) return { res, body };
+  if (!res.ok) throw githubFault(res, body);
   return { res, body };
 }
 
@@ -165,6 +213,31 @@ function parseArchive(text) {
   return { shows: parsed.shows, activeId: parsed.activeId || null };
 }
 
+function rememberKnownShows(list) {
+  knownShowIds = new Set((list || []).map((show) => show?.id).filter(Boolean));
+}
+
+function mergeArchives(local, remote) {
+  const byId = new Map();
+  for (const show of remote.shows || []) {
+    if (show?.id) byId.set(show.id, show);
+  }
+  const localIds = new Set();
+  for (const show of local.shows || []) {
+    if (!show?.id) continue;
+    localIds.add(show.id);
+    const other = byId.get(show.id);
+    if (!other || (show.updatedAt || 0) >= (other.updatedAt || 0)) byId.set(show.id, show);
+  }
+  for (const id of knownShowIds) {
+    if (!localIds.has(id)) byId.delete(id);
+  }
+  return {
+    shows: [...byId.values()].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)),
+    activeId: local.activeId || remote.activeId || null,
+  };
+}
+
 function utf8Base64(text) {
   const bytes = new TextEncoder().encode(text);
   let binary = "";
@@ -174,35 +247,55 @@ function utf8Base64(text) {
   return btoa(binary);
 }
 
-async function githubLoad() {
-  const cfg = githubConfig();
-  const { res, body } = await githubRequest(`/repos/${cfg.owner}/${cfg.repo}/contents/${GH_PATH}?ref=${encodeURIComponent(cfg.branch)}`);
-  if (res.status === 404) return { shows: [], activeId: null, sha: null, missing: true };
-  if (body?.content && body.encoding === "base64") {
-    return { ...parseArchive(decodeGithubContent(body)), sha: body.sha || null };
+async function githubRawFile(cfg, branch) {
+  const query = branch ? `?ref=${encodeURIComponent(branch)}` : "";
+  const res = await fetch(`https://api.github.com/repos/${cfg.owner}/${cfg.repo}/contents/${GH_PATH}${query}`, {
+    cache: "no-store",
+    headers: githubHeaders({ Accept: "application/vnd.github.raw" }),
+  });
+  const text = await res.text();
+  if (res.status === 404) return { missing: true };
+  if (!res.ok) {
+    let body = null;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      body = { message: text };
+    }
+    throw githubFault(res, body);
   }
-  let sha = body?.sha || null;
-  if (!sha) {
-    const tree = await githubRequest(`/repos/${cfg.owner}/${cfg.repo}/git/trees/${encodeURIComponent(cfg.branch)}?recursive=1`);
-    sha = tree.body?.tree?.find((item) => item.path === GH_PATH)?.sha || null;
-  }
-  if (!sha) throw new Error(body?.message || "read");
-  const blob = await githubRequest(`/repos/${cfg.owner}/${cfg.repo}/git/blobs/${sha}`);
-  if (!blob.res.ok || blob.body?.encoding !== "base64") throw new Error(blob.body?.message || "blob");
-  return { ...parseArchive(decodeGithubContent(blob.body)), sha };
+  return { text };
 }
 
-async function githubSaveBlob(cfg, text) {
+async function githubLoad() {
+  const cfg = githubConfig();
+  const repo = await githubRequest(`/repos/${cfg.owner}/${cfg.repo}`, { allowStatuses: [404] });
+  if (repo.res.status === 404) throw githubFault(repo.res, repo.body);
+  const branch = repo.body.default_branch || cfg.branch || "main";
+  if (branch !== cfg.branch) rememberGithub({ branch });
+  const meta = await githubRequest(`/repos/${cfg.owner}/${cfg.repo}/contents/${GH_PATH}`, { allowStatuses: [404, 403] });
+  if (meta.res.status === 404) return { shows: [], activeId: null, sha: null, missing: true, branch };
+  const sha = meta.body?.sha || null;
+  if (meta.res.ok && meta.body?.content && meta.body.encoding === "base64") {
+    const loaded = parseArchive(decodeGithubContent(meta.body));
+    rememberKnownShows(loaded.shows);
+    return { ...loaded, sha, branch };
+  }
+  const raw = await githubRawFile(cfg, branch);
+  if (raw.missing) return { shows: [], activeId: null, sha, missing: true, branch };
+  const loaded = parseArchive(raw.text);
+  rememberKnownShows(loaded.shows);
+  return { ...loaded, sha, branch };
+}
+
+async function githubSaveBlob(cfg, text, branch) {
   const blob = await githubRequest(`/repos/${cfg.owner}/${cfg.repo}/git/blobs`, {
     method: "POST",
     body: JSON.stringify({ content: utf8Base64(text), encoding: "base64" }),
   });
-  if (!blob.res.ok) throw new Error(blob.body?.message || "blob");
-  const ref = await githubRequest(`/repos/${cfg.owner}/${cfg.repo}/git/ref/heads/${cfg.branch}`);
-  if (!ref.res.ok) throw new Error(ref.body?.message || "ref");
+  const ref = await githubRequest(`/repos/${cfg.owner}/${cfg.repo}/git/ref/heads/${branch}`);
   const parent = ref.body.object.sha;
   const commit = await githubRequest(`/repos/${cfg.owner}/${cfg.repo}/git/commits/${parent}`);
-  if (!commit.res.ok) throw new Error(commit.body?.message || "commit");
   const tree = await githubRequest(`/repos/${cfg.owner}/${cfg.repo}/git/trees`, {
     method: "POST",
     body: JSON.stringify({
@@ -210,60 +303,73 @@ async function githubSaveBlob(cfg, text) {
       tree: [{ path: GH_PATH, mode: "100644", type: "blob", sha: blob.body.sha }],
     }),
   });
-  if (!tree.res.ok) throw new Error(tree.body?.message || "tree");
   const next = await githubRequest(`/repos/${cfg.owner}/${cfg.repo}/git/commits`, {
     method: "POST",
     body: JSON.stringify({ message: "更新策展存档", tree: tree.body.sha, parents: [parent] }),
   });
-  if (!next.res.ok) throw new Error(next.body?.message || "commit");
-  const update = await githubRequest(`/repos/${cfg.owner}/${cfg.repo}/git/refs/heads/${cfg.branch}`, {
+  await githubRequest(`/repos/${cfg.owner}/${cfg.repo}/git/refs/heads/${branch}`, {
     method: "PATCH",
     body: JSON.stringify({ sha: next.body.sha }),
   });
-  if (!update.res.ok) throw new Error(update.body?.message || "ref");
+}
+
+async function githubPutFile(cfg, text, sha, branch) {
+  return githubRequest(`/repos/${cfg.owner}/${cfg.repo}/contents/${GH_PATH}`, {
+    method: "PUT",
+    allowStatuses: [409],
+    body: JSON.stringify({
+      message: "更新策展存档",
+      content: utf8Base64(text),
+      sha: sha || undefined,
+      branch,
+    }),
+  });
 }
 
 async function githubSave(payload) {
   const cfg = githubConfig();
-  const text = JSON.stringify(payload);
+  const remote = await githubLoad();
+  const merged = mergeArchives(payload, remote.missing ? { shows: [], activeId: null } : remote);
+  rememberKnownShows(merged.shows);
+  const text = JSON.stringify(merged);
   const size = new TextEncoder().encode(text).length;
-  const current = await githubLoad().catch((err) => {
-    if (err.message === "auth") throw err;
-    return { sha: null };
-  });
+  const branch = remote.branch || cfg.branch || "main";
   if (size >= GH_CONTENTS_LIMIT) {
-    await githubSaveBlob(cfg, text);
-    return;
+    try {
+      await githubSaveBlob(cfg, text, branch);
+    } catch (err) {
+      if (err.status !== 422 && err.code !== "fail") throw err;
+      const again = await githubLoad();
+      const retryPayload = mergeArchives(merged, again);
+      rememberKnownShows(retryPayload.shows);
+      await githubSaveBlob(cfg, JSON.stringify(retryPayload), again.branch || branch);
+      return retryPayload;
+    }
+    return merged;
   }
-  const put = await githubRequest(`/repos/${cfg.owner}/${cfg.repo}/contents/${GH_PATH}`, {
-    method: "PUT",
-    body: JSON.stringify({
-      message: "更新策展存档",
-      content: utf8Base64(text),
-      sha: current.sha || undefined,
-      branch: cfg.branch,
-    }),
-  });
+  const put = await githubPutFile(cfg, text, remote.sha, branch);
   if (put.res.status === 409) {
     const again = await githubLoad();
-    const retry = await githubRequest(`/repos/${cfg.owner}/${cfg.repo}/contents/${GH_PATH}`, {
-      method: "PUT",
-      body: JSON.stringify({
-        message: "更新策展存档",
-        content: utf8Base64(text),
-        sha: again.sha,
-        branch: cfg.branch,
-      }),
-    });
-    if (!retry.res.ok) throw new Error(retry.body?.message || "save");
-    return;
+    const retryPayload = mergeArchives(merged, again);
+    const retryText = JSON.stringify(retryPayload);
+    const retry = await githubPutFile(cfg, retryText, again.sha, again.branch || branch);
+    if (!retry.res.ok) throw githubFault(retry.res, retry.body);
+    rememberKnownShows(retryPayload.shows);
+    return retryPayload;
   }
   if (!put.res.ok) {
-    if (size >= 700000) {
-      await githubSaveBlob(cfg, text);
-      return;
-    }
-    throw new Error(put.body?.message || "save");
+    await githubSaveBlob(cfg, text, branch);
+    return merged;
+  }
+  return merged;
+}
+
+function setGithubBusy(busy) {
+  const form = document.getElementById("github-form");
+  const button = form?.querySelector("button[type=submit]");
+  if (button) {
+    button.disabled = busy;
+    button.textContent = busy ? "正在连接…" : "连接";
   }
 }
 
@@ -274,14 +380,15 @@ function bindGithub() {
   form?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const data = new FormData(form);
-    const token = String(data.get("token") || "").trim();
+    const token = cleanToken(data.get("token"));
     const meta = document.querySelector('meta[name="gallery-data-repo"]')?.content?.trim() || "";
     const repo = (meta.includes("/") ? meta : String(data.get("repo") || "")).trim();
     if (!token || !repo.includes("/")) {
       showGithubGate("需要令牌，以及形如 用户名/hupan-museum-shows 的仓库名。");
       return;
     }
-    localStorage.setItem(GH_KEY, JSON.stringify({ token, repo, branch: "main" }));
+    rememberGithub({ token, repo });
+    setGithubBusy(true);
     try {
       const remote = await githubLoad();
       document.getElementById("github-gate").hidden = true;
@@ -299,10 +406,14 @@ function bindGithub() {
         /* the shared copy is still shown */
       }
       applyStored(remote);
-    } catch {
-      localStorage.removeItem(GH_KEY);
-      syncGithubLogout();
-      showGithubGate("这个令牌读不到策展仓库。请确认仓库名，以及令牌有读写权限。");
+    } catch (err) {
+      if (err.code === "bad") {
+        localStorage.removeItem(GH_KEY);
+        syncGithubLogout();
+      }
+      showGithubGate(explainGithub(err));
+    } finally {
+      setGithubBusy(false);
     }
   });
   logout?.addEventListener("click", () => {
@@ -314,6 +425,7 @@ function bindGithub() {
     works = [];
     decors = [];
     installs = [];
+    knownShowIds = new Set();
     setStudio(false);
     renderShows();
     renderWorks();
@@ -321,6 +433,31 @@ function bindGithub() {
     renderInstalls();
     showGithubGate();
   });
+}
+
+function queueGithubSave(payload) {
+  saveChain = saveChain
+    .then(() => githubSave(payload))
+    .then((merged) => {
+      if (!merged) return;
+      rememberKnownShows(merged.shows);
+      const open = currentShow();
+      const incoming = merged.shows.filter((show) => show && Array.isArray(show.works));
+      shows = incoming.map((show) => (open && show.id === open.id ? open : show));
+    })
+    .catch((err) => {
+      if (err.code === "bad") {
+        localStorage.removeItem(GH_KEY);
+        syncGithubLogout();
+        showGithubGate(explainGithub(err));
+        return;
+      }
+      if (err.code === "perm") {
+        setMessage("当前令牌不能写入。请把 Contents 设为 Read and write 后重新连接。");
+        return;
+      }
+      setMessage(explainGithub(err) || "这次修改没能同步到其他设备。");
+    });
 }
 
 function saveStore() {
@@ -331,18 +468,10 @@ function saveStore() {
     localStorage.removeItem(LEGACY_KEY);
     setMessage("");
   } catch {
-    setMessage("展区内容太多或图片太大，这次没能保存在本机浏览器。");
+    setMessage("展区内容太多或图片太大，这次没能保存在本机浏览器。其他设备仍以 GitHub 上的存档为准。");
   }
   if (githubConfig()) {
-    githubSave(payload).catch((err) => {
-      if (err.message === "auth") {
-        localStorage.removeItem(GH_KEY);
-        syncGithubLogout();
-        showGithubGate("令牌已失效，请重新连接。");
-        return;
-      }
-      setMessage("这次修改没能写进 GitHub，其他设备暂时看不到。");
-    });
+    queueGithubSave(payload);
     return;
   }
   if (hostedOnGithub()) return;
@@ -378,12 +507,12 @@ async function loadSharedStore() {
       }
       return remote;
     } catch (err) {
-      if (err.message === "auth") {
+      if (err.code === "bad") {
         localStorage.removeItem(GH_KEY);
         syncGithubLogout();
       }
-      showGithubGate("令牌无法读取策展存档。请确认它可以读写这个私有仓库。");
-      return { shows: [], activeId: null, hold: true };
+      showGithubGate(explainGithub(err));
+      return { shows: local.shows, activeId: local.activeId, hold: !local.shows.length };
     }
   }
   try {
@@ -3499,7 +3628,12 @@ function applyStored(stored) {
     renderShows();
     return;
   }
-  shows = stored.shows.filter((show) => show && Array.isArray(show.works) && Array.isArray(show.layout));
+  shows = stored.shows
+    .filter((show) => show && Array.isArray(show.works))
+    .map((show) => ({
+      ...show,
+      layout: Array.isArray(show.layout) ? show.layout : baseLayout.map((spot) => ({ ...spot })),
+    }));
   activeId = stored.activeId;
   if (stored.legacy) {
     const imported = {
