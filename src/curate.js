@@ -80,6 +80,7 @@ const GH_CONTENTS_LIMIT = 900000;
 
 let knownShowIds = new Set();
 let saveChain = Promise.resolve();
+let memoryGithub = null;
 
 function dataRepoName() {
   const meta = document.querySelector('meta[name="gallery-data-repo"]')?.content?.trim() || "";
@@ -103,18 +104,23 @@ function rememberGithub(partial) {
   const current = githubConfig() || {};
   const next = {
     token: partial.token || current.token,
-    repo: partial.repo || `${current.owner}/${current.repo}`,
-    branch: partial.branch || current.branch,
+    repo: partial.repo || (current.owner && current.repo ? `${current.owner}/${current.repo}` : ""),
+    branch: partial.branch || current.branch || "",
   };
-  localStorage.setItem(GH_KEY, JSON.stringify(next));
+  memoryGithub = next;
+  try {
+    localStorage.setItem(GH_KEY, JSON.stringify(next));
+  } catch {
+    /* private mode or quota; keep the token for this session */
+  }
 }
 
 function githubConfig() {
-  let saved = null;
+  let saved = memoryGithub;
   try {
-    saved = JSON.parse(localStorage.getItem(GH_KEY) || "null");
+    saved = JSON.parse(localStorage.getItem(GH_KEY) || "null") || memoryGithub;
   } catch {
-    saved = null;
+    saved = memoryGithub;
   }
   const [owner, repo] = dataRepoName().split("/");
   const token = cleanToken(saved?.token);
@@ -157,11 +163,16 @@ function githubFault(res, body) {
 }
 
 function explainGithub(err) {
+  const msg = String(err?.detail || err?.message || "");
   if (err?.code === "bad") return "令牌无效或已过期。细粒度令牌常常只有几十天，请新建一个，有效期尽量选一年或不过期。";
   if (err?.code === "perm") return "令牌权限不够。请只勾选仓库 hupan-museum-shows，并把 Contents（内容）设为 Read and write。";
   if (err?.code === "missing") return "这个令牌看不到私有仓库 hupan-museum-shows。请确认授权的是这个私有仓库，而不是公开的网站仓库。";
   if (err?.code === "rate") return "GitHub 暂时限制了请求次数，请等一两分钟再连。";
+  if (err?.code === "large" || /too large|too_large/i.test(msg)) return "策展存档比较大，读取时失败了。请再试一次，或换一个网络。";
+  if (/Failed to fetch|NetworkError|Load failed|network/i.test(msg)) return "这台设备现在连不上 GitHub。请换 Wi‑Fi，或用手机流量后再试。";
+  if (/QuotaExceeded/i.test(msg)) return "这台设备的浏览器存储已满，连上后可能无法把展览缓存在本地。";
   if (err?.detail) return `没能同步策展存档：${err.detail}`;
+  if (msg && msg !== "github") return `没能同步策展存档：${msg}`;
   return "没能同步策展存档，请再试一次。";
 }
 
@@ -203,7 +214,8 @@ async function githubRequest(path, options = {}) {
 
 function decodeGithubContent(body) {
   const binary = atob(String(body.content || "").replace(/\n/g, ""));
-  const bytes = Uint8Array.from(binary, (ch) => ch.charCodeAt(0));
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
   return new TextDecoder().decode(bytes);
 }
 
@@ -247,24 +259,10 @@ function utf8Base64(text) {
   return btoa(binary);
 }
 
-async function githubRawFile(cfg, branch) {
-  const query = branch ? `?ref=${encodeURIComponent(branch)}` : "";
-  const res = await fetch(`https://api.github.com/repos/${cfg.owner}/${cfg.repo}/contents/${GH_PATH}${query}`, {
-    cache: "no-store",
-    headers: githubHeaders({ Accept: "application/vnd.github.raw" }),
-  });
-  const text = await res.text();
-  if (res.status === 404) return { missing: true };
-  if (!res.ok) {
-    let body = null;
-    try {
-      body = JSON.parse(text);
-    } catch {
-      body = { message: text };
-    }
-    throw githubFault(res, body);
-  }
-  return { text };
+async function githubBlobText(cfg, sha) {
+  const blob = await githubRequest(`/repos/${cfg.owner}/${cfg.repo}/git/blobs/${sha}`);
+  if (blob.body?.encoding === "base64" && blob.body.content) return decodeGithubContent(blob.body);
+  throw githubFault(blob.res, blob.body || { message: "blob" });
 }
 
 async function githubLoad() {
@@ -281,9 +279,8 @@ async function githubLoad() {
     rememberKnownShows(loaded.shows);
     return { ...loaded, sha, branch };
   }
-  const raw = await githubRawFile(cfg, branch);
-  if (raw.missing) return { shows: [], activeId: null, sha, missing: true, branch };
-  const loaded = parseArchive(raw.text);
+  if (!sha) throw githubFault(meta.res, meta.body || { message: "read" });
+  const loaded = parseArchive(await githubBlobText(cfg, sha));
   rememberKnownShows(loaded.shows);
   return { ...loaded, sha, branch };
 }
@@ -387,7 +384,11 @@ function bindGithub() {
       showGithubGate("需要令牌，以及形如 用户名/hupan-museum-shows 的仓库名。");
       return;
     }
-    rememberGithub({ token, repo });
+    try {
+      rememberGithub({ token, repo });
+    } catch (err) {
+      memoryGithub = { token, repo, branch: "" };
+    }
     setGithubBusy(true);
     try {
       const remote = await githubLoad();
@@ -408,6 +409,7 @@ function bindGithub() {
       applyStored(remote);
     } catch (err) {
       if (err.code === "bad") {
+        memoryGithub = null;
         localStorage.removeItem(GH_KEY);
         syncGithubLogout();
       }
@@ -417,6 +419,7 @@ function bindGithub() {
     }
   });
   logout?.addEventListener("click", () => {
+    memoryGithub = null;
     localStorage.removeItem(GH_KEY);
     syncGithubLogout();
     if (!hostedOnGithub()) return;
@@ -447,6 +450,7 @@ function queueGithubSave(payload) {
     })
     .catch((err) => {
       if (err.code === "bad") {
+        memoryGithub = null;
         localStorage.removeItem(GH_KEY);
         syncGithubLogout();
         showGithubGate(explainGithub(err));
@@ -508,6 +512,7 @@ async function loadSharedStore() {
       return remote;
     } catch (err) {
       if (err.code === "bad") {
+        memoryGithub = null;
         localStorage.removeItem(GH_KEY);
         syncGithubLogout();
       }

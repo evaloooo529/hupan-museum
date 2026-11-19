@@ -24,7 +24,7 @@ import {
   WALL3_TRACK,
   WALLS,
 } from "./geometry.js?v=light27";
-import { initShell, noteLayoutChanged, artworkFromHit, carryingArtwork, previewCarry, placeCarry, beginArtworkMove, moveArtworkMove, endArtworkMove, carryingDecoration, previewDecor, placeDecor, decorationTargets, decorationFromHit, beginDecorMove, moveDecor, beginDecorScale, scaleDecorMove, endDecorGesture, carryingInstallation, previewInstall, placeInstall, installationTargets, installationFromHit, beginInstallMove, moveInstall, beginInstallScale, scaleInstallMove, endInstallGesture, spotlightEditing, onSpotlightMode, bindSpotLayout, saveSpotPose, setViewOnly, allowTouchPlace } from "./curate.js?v=light29";
+import { initShell, noteLayoutChanged, artworkFromHit, carryingArtwork, previewCarry, placeCarry, beginArtworkMove, moveArtworkMove, endArtworkMove, carryingDecoration, previewDecor, placeDecor, decorationTargets, decorationFromHit, beginDecorMove, moveDecor, beginDecorScale, scaleDecorMove, endDecorGesture, carryingInstallation, previewInstall, placeInstall, installationTargets, installationFromHit, beginInstallMove, moveInstall, beginInstallScale, scaleInstallMove, endInstallGesture, spotlightEditing, onSpotlightMode, bindSpotLayout, saveSpotPose, setViewOnly, allowTouchPlace } from "./curate.js?v=light30";
 
 const viewport = document.querySelector("#viewport");
 const viewTag = document.querySelector("#view-tag");
