@@ -309,6 +309,20 @@ button.tool {
   margin-bottom: 8px;
 }
 
+#upload-show {
+  margin-top: 8px;
+  width: 100%;
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+#upload-show:hover,
+#upload-show:focus-visible {
+  filter: brightness(1.05);
+  color: #fff;
+}
+
 #workspace,
 #section-curate,
 #show-studio,

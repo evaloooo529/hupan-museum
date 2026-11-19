@@ -82,11 +82,8 @@ const GH_CONTENTS_LIMIT = 900000;
 const fileShas = new Map();
 
 let knownShowIds = new Set();
-let saveChain = Promise.resolve();
 let memoryGithub = null;
 let lastRemoteSha = null;
-let pendingSave = null;
-let saveTimer = 0;
 const IDB_NAME = "hupan-museum";
 const IDB_STORE = "kv";
 
@@ -389,6 +386,26 @@ function showFilePath(id) {
   return `${GH_SHOW_DIR}/${id}.json`;
 }
 
+function showFileBody(show) {
+  const copy = { ...show };
+  delete copy._unpublished;
+  delete copy._partial;
+  delete copy.workCount;
+  delete copy.decorCount;
+  delete copy.installCount;
+  return JSON.stringify(copy);
+}
+
+function listedShows() {
+  return (shows || []).filter((show) => show && !show._unpublished);
+}
+
+function listedPayload() {
+  const listed = listedShows();
+  const aid = listed.some((show) => show.id === activeId) ? activeId : listed[0]?.id || null;
+  return { shows: listed, activeId: aid };
+}
+
 function summarizeShows(list) {
   return (list || [])
     .filter((show) => show?.id)
@@ -529,7 +546,7 @@ async function githubLoad() {
   return { shows: loaded, activeId: index.activeId || null, sha: indexFile.sha, branch: indexFile.branch };
 }
 
-async function githubSave(payload) {
+async function githubSave(payload, opts = {}) {
   const { branch } = await githubRepoBranch();
   const indexFile = await githubGetFile(GH_INDEX);
   let remoteIndex = { shows: [], activeId: null };
@@ -540,31 +557,37 @@ async function githubSave(payload) {
       remoteIndex = { shows: [], activeId: null };
     }
   }
-  const localById = new Map((payload.shows || []).filter((show) => show?.id).map((show) => [show.id, show]));
+  const localById = new Map((payload.shows || []).filter((show) => show?.id && !show._unpublished).map((show) => [show.id, show]));
   const remoteSumById = new Map((remoteIndex.shows || []).filter((row) => row?.id).map((row) => [row.id, row]));
+  const writeIds = opts.indexOnly ? new Set() : new Set(opts.ids || [...localById.keys()]);
   const merged = new Map();
   for (const [id, sum] of remoteSumById) {
     if (localById.has(id) || knownShowIds.has(id)) continue;
     merged.set(id, stubShow(sum));
   }
   for (const show of payload.shows || []) {
-    if (!show?.id) continue;
+    if (!show?.id || show._unpublished) continue;
     merged.set(show.id, pickShow(show, remoteSumById.get(show.id) ? stubShow(remoteSumById.get(show.id)) : null));
   }
-  const shows = [...merged.values()].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
-  rememberKnownShows(shows);
-  for (const show of shows) {
-    const local = localById.get(show.id);
-    const remoteSum = remoteSumById.get(show.id);
-    if (!local || local._partial) continue;
-    if (remoteSum && (local.updatedAt || 0) < (remoteSum.updatedAt || 0)) continue;
-    const path = showFilePath(show.id);
-    await githubWriteFile(path, JSON.stringify(show), fileShas.get(path), branch);
+  const nextShows = [...merged.values()].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  rememberKnownShows(nextShows);
+  if (!opts.indexOnly) {
+    for (const show of nextShows) {
+      if (!writeIds.has(show.id)) continue;
+      const local = localById.get(show.id);
+      if (!local || local._partial || local._unpublished) continue;
+      const path = showFilePath(show.id);
+      await githubWriteFile(path, showFileBody(local), fileShas.get(path), branch);
+    }
   }
-  const index = { activeId: payload.activeId || remoteIndex.activeId || null, shows: summarizeShows(shows) };
+  const indexRows = nextShows.map((show) => {
+    if (writeIds.has(show.id) && !show._partial) return summarizeShows([show])[0];
+    return remoteSumById.get(show.id) || summarizeShows([show])[0];
+  });
+  const index = { activeId: payload.activeId || remoteIndex.activeId || null, shows: indexRows };
   await githubWriteFile(GH_INDEX, JSON.stringify(index), indexFile.sha || fileShas.get(GH_INDEX), branch);
   lastRemoteSha = fileShas.get(GH_INDEX) || lastRemoteSha;
-  return { shows, activeId: index.activeId };
+  return { shows: nextShows, activeId: index.activeId };
 }
 
 function setGithubBusy(busy) {
@@ -650,61 +673,56 @@ function bindGithub() {
   });
 }
 
-function queueGithubSave(payload) {
-  pendingSave = payload;
-  window.clearTimeout(saveTimer);
-  saveTimer = window.setTimeout(() => {
-    const next = pendingSave;
-    pendingSave = null;
-    saveChain = saveChain
-      .then(async () => {
-        setMessage("正在同步到其他设备…");
-        const merged = await githubSave(next);
-        if (!merged) return;
-        rememberKnownShows(merged.shows);
-        setMessage("已同步到其他设备。");
-      })
-      .catch((err) => {
-        if (err.code === "bad") {
-          memoryGithub = null;
-          localStorage.removeItem(GH_KEY);
-          syncGithubLogout();
-          showGithubGate(explainGithub(err));
-          return;
-        }
-        if (err.code === "perm") {
-          setMessage("当前令牌不能写入。请把 Contents 设为 Read and write 后重新连接。本机这次修改已经记下。");
-          return;
-        }
-        setMessage(`${explainGithub(err)} 本机已经记下，其他设备稍后再刷新。`);
+async function pushListed(opts = {}) {
+  const payload = listedPayload();
+  await writeLocalArchive(payload);
+  if (!githubConfig()) {
+    if (hostedOnGithub()) {
+      setMessage("已写入本机策展列表。连接 GitHub 后才能同步到其他设备。");
+      return;
+    }
+    try {
+      const res = await fetch("/api/shows", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
       });
-  }, 1600);
+      if (res.status === 401) {
+        window.location.href = "/login";
+        return;
+      }
+      if (!res.ok) throw new Error("save");
+      setMessage("已保存进策展列表。");
+    } catch {
+      setMessage("展览没能写进共享存档，其他浏览器暂时看不到这次修改。");
+    }
+    return;
+  }
+  setMessage("正在保存进策展列表…");
+  try {
+    const merged = await githubSave(payload, opts);
+    if (merged) rememberKnownShows(merged.shows);
+    setMessage("已保存进策展列表，其他设备刷新后可以看到。");
+  } catch (err) {
+    if (err.code === "bad") {
+      cachedRepo = null;
+      memoryGithub = null;
+      localStorage.removeItem(GH_KEY);
+      syncGithubLogout();
+      showGithubGate(explainGithub(err));
+      return;
+    }
+    if (err.code === "perm") {
+      setMessage("当前令牌不能写入。请把 Contents 设为 Read and write 后重新连接。本机这次修改已经记下。");
+      return;
+    }
+    setMessage(`${explainGithub(err)} 本机列表已记下，其他设备稍后再刷新。`);
+  }
 }
 
 function saveStore() {
   persistActive();
-  const payload = { shows, activeId };
-  writeLocalArchive(payload).catch(() => {});
-  if (githubConfig()) {
-    setMessage("本机已保存，即将同步…");
-    queueGithubSave(payload);
-    return;
-  }
-  setMessage("");
-  if (hostedOnGithub()) return;
-  fetch("/api/shows", {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  }).then((res) => {
-    if (res.status === 401) {
-      window.location.href = "/login";
-      return;
-    }
-    if (!res.ok) setMessage("展览没能写进共享存档，其他浏览器暂时看不到这次修改。");
-  }).catch(() => {
-    setMessage("展览没能写进共享存档，其他浏览器暂时看不到这次修改。");
-  });
+  writeLocalArchive(listedPayload()).catch(() => {});
 }
 
 async function loadSharedStore() {
@@ -792,6 +810,8 @@ function goBack() {
   const studio = document.getElementById("show-studio");
   const inCurate = !document.getElementById("section-curate").hidden;
   if (inCurate && studio && !studio.hidden) {
+    const draft = currentShow();
+    if (draft?._unpublished && !confirm("还没有上传到策展列表，返回后这次布置会丢掉。确定返回？")) return;
     setStudio(false);
     return;
   }
@@ -1796,7 +1816,28 @@ function formatWhen(ts) {
   return `${date.getMonth() + 1}月${date.getDate()}日`;
 }
 
+function abandonUnpublished() {
+  const dropped = shows.filter((show) => show._unpublished);
+  if (!dropped.length) return;
+  const dropIds = new Set(dropped.map((show) => show.id));
+  shows = shows.filter((show) => !show._unpublished);
+  if (dropIds.has(activeId)) {
+    activeId = null;
+    works = [];
+    decors = [];
+    installs = [];
+    clearAllArt();
+    clearInstallMeshes();
+    publishSpots();
+    applyLayout(baseLayout);
+    renderWorks();
+    renderDecors();
+    renderInstalls();
+  }
+}
+
 function setStudio(open) {
+  if (!open) abandonUnpublished();
   document.getElementById("show-studio").hidden = !open;
   document.getElementById("open-show-dialog").hidden = open;
   document.getElementById("show-list-title").hidden = open;
@@ -1813,6 +1854,7 @@ function setStudio(open) {
     if (decorCarry) stopDecorCarry(false);
     if (installCarry) stopInstallCarry(false);
     setSpotMode(false);
+    renderShows();
   }
   const show = currentShow();
   const title = document.getElementById("curate-title");
@@ -1822,11 +1864,11 @@ function setStudio(open) {
 
 function renderShows() {
   const list = document.getElementById("show-list");
-  if (!shows.length) {
+  if (!listedShows().length) {
     list.innerHTML = `<p class="empty">还没有展览。新建后会从展厅模型开始策展。</p>`;
     return;
   }
-  list.innerHTML = shows
+  list.innerHTML = listedShows()
     .map((show) => {
       const when = formatWhen(show.updatedAt || show.createdAt);
       const workN = show._partial ? show.workCount ?? "…" : show.works.filter((work) => !work.poster).length;
@@ -1873,6 +1915,7 @@ function renameShow(id, name) {
   }
   saveStore();
   renderShows();
+  pushListed({ ids: [id] });
 }
 
 function createShow(name) {
@@ -1886,11 +1929,11 @@ function createShow(name) {
     works: [],
     decorations: [],
     installations: [],
+    _unpublished: true,
   };
   shows.unshift(show);
-  saveStore();
-  renderShows();
-  setStudio(false);
+  activateShow(show);
+  setMessage("布置完成后，点最下方「上传到策展列表」。未上传前不会出现在列表里。");
 }
 
 async function fillShowFromGithub(show) {
@@ -1907,7 +1950,7 @@ async function fillShowFromGithub(show) {
   Object.assign(show, full);
   show._partial = false;
   fileShas.set(showFilePath(show.id), file.sha);
-  await writeLocalArchive({ shows, activeId });
+  await writeLocalArchive(listedPayload());
   return show;
 }
 
@@ -1915,6 +1958,11 @@ async function openShow(id) {
   if (id === activeId) {
     setStudio(true);
     return;
+  }
+  const draft = currentShow();
+  if (draft?._unpublished) {
+    if (!confirm("还没有上传到策展列表，打开其他展览后这次布置会丢掉。确定打开？")) return;
+    abandonUnpublished();
   }
   persistActive();
   const show = shows.find((item) => item.id === id);
@@ -1952,6 +2000,24 @@ function deleteShow(id) {
   }
   saveStore();
   renderShows();
+  pushListed({ indexOnly: true });
+}
+
+async function uploadCurrentShow() {
+  persistActive();
+  const show = currentShow();
+  if (!show) return;
+  const button = document.getElementById("upload-show");
+  if (button) button.disabled = true;
+  show._unpublished = false;
+  show.updatedAt = Date.now();
+  saveStore();
+  renderShows();
+  try {
+    await pushListed({ ids: [show.id] });
+  } finally {
+    if (button) button.disabled = false;
+  }
 }
 
 function bindShows() {
@@ -1979,6 +2045,7 @@ function bindShows() {
   }
 
   document.getElementById("open-show-dialog").addEventListener("click", () => openShowDialog(null));
+  document.getElementById("upload-show")?.addEventListener("click", () => uploadCurrentShow());
   dialog.addEventListener("click", (event) => {
     if (event.target === dialog) {
       dialog.hidden = true;
