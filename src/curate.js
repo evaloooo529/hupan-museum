@@ -804,6 +804,8 @@ function showHome() {
   document.getElementById("show-dialog").hidden = true;
   document.getElementById("show-menu").hidden = true;
   document.getElementById("install-dialog").hidden = true;
+  const upload = document.getElementById("upload-show");
+  if (upload) upload.hidden = true;
 }
 
 function goBack() {
@@ -1839,6 +1841,8 @@ function abandonUnpublished() {
 function setStudio(open) {
   if (!open) abandonUnpublished();
   document.getElementById("show-studio").hidden = !open;
+  const upload = document.getElementById("upload-show");
+  if (upload) upload.hidden = !open;
   document.getElementById("open-show-dialog").hidden = open;
   document.getElementById("show-list-title").hidden = open;
   document.getElementById("show-dialog").hidden = true;
@@ -1933,7 +1937,7 @@ function createShow(name) {
   };
   shows.unshift(show);
   activateShow(show);
-  setMessage("布置完成后，点最下方「上传到策展列表」。未上传前不会出现在列表里。");
+  setMessage("布置完成后点最下方「上传」。未上传前不会出现在列表里。");
 }
 
 async function fillShowFromGithub(show) {

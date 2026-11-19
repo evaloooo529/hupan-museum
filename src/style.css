@@ -38,9 +38,9 @@ aside {
   padding: 22px 20px 18px;
   background: var(--panel);
   border-right: 1px solid rgba(47, 95, 191, 0.18);
-  overflow-x: hidden;
-  overflow-y: auto;
-  scrollbar-gutter: stable;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   backdrop-filter: blur(8px);
 }
 
@@ -309,18 +309,22 @@ button.tool {
   margin-bottom: 8px;
 }
 
-#upload-show {
-  margin-top: 8px;
-  width: 100%;
-  background: var(--accent);
-  border-color: var(--accent);
-  color: #fff;
+#nav-home,
+#workspace {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
 }
 
-#upload-show:hover,
-#upload-show:focus-visible {
-  filter: brightness(1.05);
-  color: #fff;
+#upload-show {
+  flex: 0 0 auto;
+  align-self: center;
+  width: auto;
+  margin: 12px 0 0;
+  justify-content: center;
+  text-align: center;
 }
 
 #workspace,
@@ -1003,7 +1007,7 @@ button.shot:focus-visible {
 }
 
 #github-logout {
-  margin: 12px 16px 16px;
+  margin: 12px 0 0;
   align-self: flex-start;
   border: 0;
   background: transparent;
