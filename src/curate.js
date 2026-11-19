@@ -76,7 +76,10 @@ function persistActive() {
 
 const GH_KEY = "school-art-museum-github";
 const GH_PATH = "data/shows.json";
+const GH_INDEX = "data/index.json";
+const GH_SHOW_DIR = "data/shows";
 const GH_CONTENTS_LIMIT = 900000;
+const fileShas = new Map();
 
 let knownShowIds = new Set();
 let saveChain = Promise.resolve();
@@ -313,6 +316,22 @@ function rememberKnownShows(list) {
   knownShowIds = new Set((list || []).map((show) => show?.id).filter(Boolean));
 }
 
+function unionArchives(local, remote) {
+  const byId = new Map();
+  for (const show of remote.shows || []) {
+    if (show?.id) byId.set(show.id, show);
+  }
+  for (const show of local.shows || []) {
+    if (!show?.id) continue;
+    const other = byId.get(show.id);
+    if (!other || (show.updatedAt || 0) >= (other.updatedAt || 0)) byId.set(show.id, show);
+  }
+  return {
+    shows: [...byId.values()].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)),
+    activeId: local.activeId || remote.activeId || null,
+  };
+}
+
 function mergeArchives(local, remote) {
   const byId = new Map();
   for (const show of remote.shows || []) {
@@ -349,39 +368,43 @@ async function githubBlobText(cfg, sha) {
   throw githubFault(blob.res, blob.body || { message: "blob" });
 }
 
-async function githubLoad() {
+function showFilePath(id) {
+  return `${GH_SHOW_DIR}/${id}.json`;
+}
+
+function summarizeShows(list) {
+  return (list || [])
+    .filter((show) => show?.id)
+    .map((show) => ({
+      id: show.id,
+      name: show.name,
+      createdAt: show.createdAt,
+      updatedAt: show.updatedAt,
+    }));
+}
+
+async function githubRepoBranch() {
   const cfg = githubConfig();
   const repo = await githubRequest(`/repos/${cfg.owner}/${cfg.repo}`, { allowStatuses: [404] });
   if (repo.res.status === 404) throw githubFault(repo.res, repo.body);
   const branch = repo.body.default_branch || cfg.branch || "main";
   if (branch !== cfg.branch) rememberGithub({ branch });
-  const meta = await githubRequest(`/repos/${cfg.owner}/${cfg.repo}/contents/${GH_PATH}`, { allowStatuses: [404, 403] });
-  if (meta.res.status === 404) return { shows: [], activeId: null, sha: null, missing: true, branch };
+  return { cfg, branch };
+}
+
+async function githubGetFile(path) {
+  const { cfg, branch } = await githubRepoBranch();
+  const meta = await githubRequest(`/repos/${cfg.owner}/${cfg.repo}/contents/${path}`, { allowStatuses: [404, 403] });
+  if (meta.res.status === 404) return { missing: true, sha: null, text: null, branch };
   const sha = meta.body?.sha || null;
   if (meta.res.ok && meta.body?.content && meta.body.encoding === "base64") {
-    const loaded = parseArchive(decodeGithubContent(meta.body));
-    rememberKnownShows(loaded.shows);
-    lastRemoteSha = sha;
-    return { ...loaded, sha, branch };
+    return { missing: false, sha, text: decodeGithubContent(meta.body), branch };
   }
-  if (!sha) throw githubFault(meta.res, meta.body || { message: "read" });
-  const loaded = parseArchive(await githubBlobText(cfg, sha));
-  rememberKnownShows(loaded.shows);
-  lastRemoteSha = sha;
-  return { ...loaded, sha, branch };
+  if (sha) return { missing: false, sha, text: await githubBlobText(cfg, sha), branch };
+  throw githubFault(meta.res, meta.body || { message: "read" });
 }
 
-async function githubMeta() {
-  const cfg = githubConfig();
-  const repo = await githubRequest(`/repos/${cfg.owner}/${cfg.repo}`, { allowStatuses: [404] });
-  if (repo.res.status === 404) throw githubFault(repo.res, repo.body);
-  const branch = repo.body.default_branch || cfg.branch || "main";
-  const meta = await githubRequest(`/repos/${cfg.owner}/${cfg.repo}/contents/${GH_PATH}`, { allowStatuses: [404, 403] });
-  if (meta.res.status === 404) return { sha: null, missing: true, branch };
-  return { sha: meta.body?.sha || null, missing: false, branch };
-}
-
-async function githubSaveBlob(cfg, text, branch) {
+async function githubSaveBlobAt(cfg, path, text, branch) {
   const blob = await githubRequest(`/repos/${cfg.owner}/${cfg.repo}/git/blobs`, {
     method: "POST",
     body: JSON.stringify({ content: utf8Base64(text), encoding: "base64" }),
@@ -393,7 +416,7 @@ async function githubSaveBlob(cfg, text, branch) {
     method: "POST",
     body: JSON.stringify({
       base_tree: commit.body.tree.sha,
-      tree: [{ path: GH_PATH, mode: "100644", type: "blob", sha: blob.body.sha }],
+      tree: [{ path, mode: "100644", type: "blob", sha: blob.body.sha }],
     }),
   });
   const next = await githubRequest(`/repos/${cfg.owner}/${cfg.repo}/git/commits`, {
@@ -404,13 +427,20 @@ async function githubSaveBlob(cfg, text, branch) {
     method: "PATCH",
     body: JSON.stringify({ sha: next.body.sha }),
   });
+  fileShas.set(path, blob.body.sha);
   return blob.body.sha;
 }
 
-async function githubPutFile(cfg, text, sha, branch) {
-  return githubRequest(`/repos/${cfg.owner}/${cfg.repo}/contents/${GH_PATH}`, {
+async function githubWriteFile(path, text, sha, branch) {
+  const cfg = githubConfig();
+  const size = new TextEncoder().encode(text).length;
+  if (size >= GH_CONTENTS_LIMIT) {
+    await githubSaveBlobAt(cfg, path, text, branch);
+    return;
+  }
+  const put = await githubRequest(`/repos/${cfg.owner}/${cfg.repo}/contents/${path}`, {
     method: "PUT",
-    allowStatuses: [409],
+    allowStatuses: [409, 422],
     body: JSON.stringify({
       message: "更新策展存档",
       content: utf8Base64(text),
@@ -418,49 +448,110 @@ async function githubPutFile(cfg, text, sha, branch) {
       branch,
     }),
   });
+  if (put.res.status === 409 || put.res.status === 422) {
+    const again = await githubGetFile(path);
+    const retry = await githubRequest(`/repos/${cfg.owner}/${cfg.repo}/contents/${path}`, {
+      method: "PUT",
+      body: JSON.stringify({
+        message: "更新策展存档",
+        content: utf8Base64(text),
+        sha: again.sha || undefined,
+        branch: again.branch || branch,
+      }),
+    });
+    fileShas.set(path, retry.body?.content?.sha || again.sha);
+    return;
+  }
+  if (!put.res.ok) {
+    await githubSaveBlobAt(cfg, path, text, branch);
+    return;
+  }
+  fileShas.set(path, put.body?.content?.sha || sha);
+}
+
+async function githubLoad() {
+  const indexFile = await githubGetFile(GH_INDEX);
+  if (indexFile.missing) {
+    const legacy = await githubGetFile(GH_PATH);
+    if (legacy.missing) return { shows: [], activeId: null, sha: null, missing: true, branch: indexFile.branch };
+    const loaded = parseArchive(legacy.text);
+    rememberKnownShows(loaded.shows);
+    lastRemoteSha = legacy.sha;
+    return { ...loaded, sha: legacy.sha, branch: legacy.branch };
+  }
+  const index = JSON.parse(indexFile.text);
+  fileShas.set(GH_INDEX, indexFile.sha);
+  lastRemoteSha = indexFile.sha;
+  const rows = Array.isArray(index.shows) ? index.shows : [];
+  const shows = [];
+  for (const row of rows) {
+    if (!row?.id) continue;
+    const file = await githubGetFile(showFilePath(row.id));
+    if (file.missing) {
+      shows.push({
+        id: row.id,
+        name: row.name || "未命名展览",
+        createdAt: row.createdAt || Date.now(),
+        updatedAt: row.updatedAt || Date.now(),
+        layout: [],
+        works: [],
+        decorations: [],
+        installations: [],
+      });
+      continue;
+    }
+    fileShas.set(showFilePath(row.id), file.sha);
+    shows.push(JSON.parse(file.text));
+  }
+  rememberKnownShows(shows);
+  return { shows, activeId: index.activeId || null, sha: indexFile.sha, branch: indexFile.branch };
 }
 
 async function githubSave(payload) {
-  const cfg = githubConfig();
-  const meta = await githubMeta();
-  let merged = payload;
-  if (!meta.missing && meta.sha && meta.sha !== lastRemoteSha) {
-    const remote = await githubLoad();
-    merged = mergeArchives(payload, remote.missing ? { shows: [], activeId: null } : remote);
-  }
-  rememberKnownShows(merged.shows);
-  const text = JSON.stringify(merged);
-  const size = new TextEncoder().encode(text).length;
-  const branch = meta.branch || cfg.branch || "main";
-  if (size >= GH_CONTENTS_LIMIT) {
+  const { branch } = await githubRepoBranch();
+  const indexFile = await githubGetFile(GH_INDEX);
+  let remoteIndex = { shows: [], activeId: null };
+  if (!indexFile.missing) {
     try {
-      lastRemoteSha = await githubSaveBlob(cfg, text, branch);
-    } catch (err) {
-      if (err.status !== 422 && err.code !== "fail" && !isRetryable(err)) throw err;
-      const again = await githubLoad();
-      const retryPayload = mergeArchives(merged, again);
-      rememberKnownShows(retryPayload.shows);
-      lastRemoteSha = await githubSaveBlob(cfg, JSON.stringify(retryPayload), again.branch || branch);
-      return retryPayload;
+      remoteIndex = JSON.parse(indexFile.text) || remoteIndex;
+    } catch {
+      remoteIndex = { shows: [], activeId: null };
     }
-    return merged;
   }
-  const put = await githubPutFile(cfg, text, meta.sha, branch);
-  if (put.res.status === 409) {
-    const again = await githubLoad();
-    const retryPayload = mergeArchives(merged, again);
-    const retry = await githubPutFile(cfg, JSON.stringify(retryPayload), again.sha, again.branch || branch);
-    if (!retry.res.ok) throw githubFault(retry.res, retry.body);
-    rememberKnownShows(retryPayload.shows);
-    lastRemoteSha = again.sha;
-    return retryPayload;
+  const localById = new Map((payload.shows || []).filter((show) => show?.id).map((show) => [show.id, show]));
+  const remoteSumById = new Map((remoteIndex.shows || []).filter((row) => row?.id).map((row) => [row.id, row]));
+  const merged = new Map();
+  for (const [id] of remoteSumById) {
+    if (localById.has(id) || knownShowIds.has(id)) continue;
+    const file = await githubGetFile(showFilePath(id));
+    if (!file.missing) {
+      fileShas.set(showFilePath(id), file.sha);
+      merged.set(id, JSON.parse(file.text));
+    }
   }
-  if (!put.res.ok) {
-    lastRemoteSha = await githubSaveBlob(cfg, text, branch);
-    return merged;
+  for (const show of payload.shows || []) {
+    if (!show?.id) continue;
+    const remoteSum = remoteSumById.get(show.id);
+    if (!remoteSum || (show.updatedAt || 0) >= (remoteSum.updatedAt || 0)) merged.set(show.id, show);
+    else if (!merged.has(show.id)) {
+      const file = await githubGetFile(showFilePath(show.id));
+      merged.set(show.id, file.missing ? show : JSON.parse(file.text));
+      if (!file.missing) fileShas.set(showFilePath(show.id), file.sha);
+    }
   }
-  lastRemoteSha = put.body?.content?.sha || lastRemoteSha;
-  return merged;
+  const shows = [...merged.values()].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  rememberKnownShows(shows);
+  for (const show of shows) {
+    const local = localById.get(show.id);
+    const remoteSum = remoteSumById.get(show.id);
+    if (!local || (remoteSum && (local.updatedAt || 0) < (remoteSum.updatedAt || 0))) continue;
+    const path = showFilePath(show.id);
+    await githubWriteFile(path, JSON.stringify(show), fileShas.get(path), branch);
+  }
+  const index = { activeId: payload.activeId || remoteIndex.activeId || null, shows: summarizeShows(shows) };
+  await githubWriteFile(GH_INDEX, JSON.stringify(index), indexFile.sha || fileShas.get(GH_INDEX), branch);
+  lastRemoteSha = fileShas.get(GH_INDEX) || lastRemoteSha;
+  return { shows, activeId: index.activeId };
 }
 
 function setGithubBusy(busy) {
@@ -496,15 +587,15 @@ function bindGithub() {
       const remote = await githubLoad();
       document.getElementById("github-gate").hidden = true;
       syncGithubLogout();
-      if (remote.missing) {
-        const local = await loadLocalArchive();
-        if (local.shows.length) {
-          applyStored({ ...local, upload: true });
-          return;
-        }
+      const local = await loadLocalArchive();
+      if (remote.missing && local.shows.length) {
+        applyStored({ ...local, upload: true });
+        return;
       }
-      await writeLocalArchive({ shows: remote.shows, activeId: remote.activeId });
-      applyStored(remote);
+      const combined = unionArchives(local, remote);
+      rememberKnownShows(combined.shows);
+      await writeLocalArchive(combined);
+      applyStored(combined);
     } catch (err) {
       if (err.code === "bad") {
         memoryGithub = null;
@@ -613,8 +704,10 @@ async function loadSharedStore() {
     try {
       const remote = await githubLoad();
       if (remote.missing && local.shows.length) return { ...local, upload: true };
-      await writeLocalArchive({ shows: remote.shows, activeId: remote.activeId });
-      return remote;
+      const combined = unionArchives(local, remote);
+      rememberKnownShows(combined.shows);
+      await writeLocalArchive(combined);
+      return combined;
     } catch (err) {
       if (err.code === "bad") {
         memoryGithub = null;
