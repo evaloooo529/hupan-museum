@@ -662,7 +662,7 @@ function queueGithubSave(payload) {
         const merged = await githubSave(next);
         if (!merged) return;
         rememberKnownShows(merged.shows);
-        setMessage("");
+        setMessage("已同步到其他设备。");
       })
       .catch((err) => {
         if (err.code === "bad") {
@@ -685,11 +685,12 @@ function saveStore() {
   persistActive();
   const payload = { shows, activeId };
   writeLocalArchive(payload).catch(() => {});
-  setMessage("");
   if (githubConfig()) {
+    setMessage("本机已保存，即将同步…");
     queueGithubSave(payload);
     return;
   }
+  setMessage("");
   if (hostedOnGithub()) return;
   fetch("/api/shows", {
     method: "PUT",

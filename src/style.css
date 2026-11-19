@@ -611,6 +611,11 @@ textarea {
   color: var(--muted);
 }
 
+#curate-msg:not(:empty) {
+  min-height: 1.45em;
+  color: #4a5560;
+}
+
 .size-row {
   display: flex;
   flex-direction: column;
