@@ -241,9 +241,11 @@ function explainGithub(err) {
   if (err?.code === "bad") return "令牌无效或已过期。细粒度令牌常常只有几十天，请新建一个，有效期尽量选一年或不过期。";
   if (err?.code === "perm") return "令牌权限不够。请只勾选仓库 hupan-museum-shows，并把 Contents（内容）设为 Read and write。";
   if (err?.code === "missing") return "这个令牌看不到私有仓库 hupan-museum-shows。请确认授权的是这个私有仓库，而不是公开的网站仓库。";
-  if (err?.code === "rate") return "GitHub 暂时限制了请求次数，请等一两分钟再连。";
+  if (err?.code === "rate") return "GitHub 暂时限制了请求次数，请等一两分钟再打开或同步。";
   if (err?.code === "large" || /too large|too_large/i.test(msg)) return "策展存档比较大，读取时失败了。请再试一次，或换一个网络。";
-  if (/Failed to fetch|NetworkError|Load failed|network/i.test(msg)) return "这台设备现在连不上 GitHub。请换 Wi‑Fi，或用手机流量后再试。";
+  if (/Failed to fetch|NetworkError|Load failed|AbortError|timeout|network/i.test(msg)) {
+    return "暂时连不上 GitHub。本机展览还在，请稍后再同步；新设备请换网络后重试。";
+  }
   if (/QuotaExceeded/i.test(msg)) return "这台设备的浏览器存储已满，连上后可能无法把展览缓存在本地。";
   if (err?.detail) return `没能同步策展存档：${err.detail}`;
   if (msg && msg !== "github") return `没能同步策展存档：${msg}`;
@@ -267,16 +269,24 @@ async function githubRequest(path, options = {}) {
   const allowed = options.allowStatuses || [];
   const { allowStatuses: _allow, ...rest } = options;
   let lastErr = null;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      const res = await fetch(`https://api.github.com${path}`, {
-        cache: "no-store",
-        ...rest,
-        headers: githubHeaders({
-          Accept: "application/vnd.github+json",
-          ...(rest.headers || {}),
-        }),
-      });
+      const ctrl = new AbortController();
+      const timer = window.setTimeout(() => ctrl.abort(), 20000);
+      let res;
+      try {
+        res = await fetch(`https://api.github.com${path}`, {
+          cache: "no-store",
+          ...rest,
+          signal: ctrl.signal,
+          headers: githubHeaders({
+            Accept: "application/vnd.github+json",
+            ...(rest.headers || {}),
+          }),
+        });
+      } finally {
+        window.clearTimeout(timer);
+      }
       const text = await res.text();
       let body = null;
       try {
@@ -286,15 +296,15 @@ async function githubRequest(path, options = {}) {
       }
       if (allowed.includes(res.status) || res.ok) return { res, body };
       const err = githubFault(res, body);
-      if (!isRetryable(err) || attempt === 2) throw err;
+      if (!isRetryable(err) || attempt === 1) throw err;
       lastErr = err;
     } catch (err) {
       if (err.code === "bad" || err.code === "perm" || err.code === "missing") throw err;
       lastErr = err;
       if (!isRetryable(err) && err.code && err.code !== "fail") throw err;
-      if (attempt === 2) throw err;
+      if (attempt === 1) throw err;
     }
-    await waitMs(700 * (attempt + 1));
+    await waitMs(lastErr?.code === "rate" ? 2500 * (attempt + 1) : 800 * (attempt + 1));
   }
   throw lastErr;
 }
@@ -316,6 +326,14 @@ function rememberKnownShows(list) {
   knownShowIds = new Set((list || []).map((show) => show?.id).filter(Boolean));
 }
 
+function pickShow(a, b) {
+  if (!b) return a;
+  if (!a) return b;
+  if (a._partial && !b._partial) return b;
+  if (b._partial && !a._partial) return a;
+  return (a.updatedAt || 0) >= (b.updatedAt || 0) ? a : b;
+}
+
 function unionArchives(local, remote) {
   const byId = new Map();
   for (const show of remote.shows || []) {
@@ -323,8 +341,7 @@ function unionArchives(local, remote) {
   }
   for (const show of local.shows || []) {
     if (!show?.id) continue;
-    const other = byId.get(show.id);
-    if (!other || (show.updatedAt || 0) >= (other.updatedAt || 0)) byId.set(show.id, show);
+    byId.set(show.id, pickShow(show, byId.get(show.id)));
   }
   return {
     shows: [...byId.values()].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)),
@@ -380,16 +397,40 @@ function summarizeShows(list) {
       name: show.name,
       createdAt: show.createdAt,
       updatedAt: show.updatedAt,
+      workCount: Array.isArray(show.works) ? show.works.filter((work) => !work.poster).length : show.workCount,
+      decorCount: Array.isArray(show.decorations) ? show.decorations.length : show.decorCount,
+      installCount: Array.isArray(show.installations) ? show.installations.length : show.installCount,
     }));
 }
 
+function stubShow(row) {
+  return {
+    id: row.id,
+    name: row.name || "未命名展览",
+    createdAt: row.createdAt || Date.now(),
+    updatedAt: row.updatedAt || Date.now(),
+    layout: [],
+    works: [],
+    decorations: [],
+    installations: [],
+    workCount: row.workCount,
+    decorCount: row.decorCount,
+    installCount: row.installCount,
+    _partial: true,
+  };
+}
+
+let cachedRepo = null;
+
 async function githubRepoBranch() {
   const cfg = githubConfig();
+  if (cachedRepo && cachedRepo.cfg?.token === cfg?.token && cachedRepo.branch) return cachedRepo;
   const repo = await githubRequest(`/repos/${cfg.owner}/${cfg.repo}`, { allowStatuses: [404] });
   if (repo.res.status === 404) throw githubFault(repo.res, repo.body);
   const branch = repo.body.default_branch || cfg.branch || "main";
   if (branch !== cfg.branch) rememberGithub({ branch });
-  return { cfg, branch };
+  cachedRepo = { cfg, branch };
+  return cachedRepo;
 }
 
 async function githubGetFile(path) {
@@ -483,28 +524,9 @@ async function githubLoad() {
   fileShas.set(GH_INDEX, indexFile.sha);
   lastRemoteSha = indexFile.sha;
   const rows = Array.isArray(index.shows) ? index.shows : [];
-  const shows = [];
-  for (const row of rows) {
-    if (!row?.id) continue;
-    const file = await githubGetFile(showFilePath(row.id));
-    if (file.missing) {
-      shows.push({
-        id: row.id,
-        name: row.name || "未命名展览",
-        createdAt: row.createdAt || Date.now(),
-        updatedAt: row.updatedAt || Date.now(),
-        layout: [],
-        works: [],
-        decorations: [],
-        installations: [],
-      });
-      continue;
-    }
-    fileShas.set(showFilePath(row.id), file.sha);
-    shows.push(JSON.parse(file.text));
-  }
-  rememberKnownShows(shows);
-  return { shows, activeId: index.activeId || null, sha: indexFile.sha, branch: indexFile.branch };
+  const loaded = rows.filter((row) => row?.id).map((row) => stubShow(row));
+  rememberKnownShows(loaded);
+  return { shows: loaded, activeId: index.activeId || null, sha: indexFile.sha, branch: indexFile.branch };
 }
 
 async function githubSave(payload) {
@@ -521,30 +543,21 @@ async function githubSave(payload) {
   const localById = new Map((payload.shows || []).filter((show) => show?.id).map((show) => [show.id, show]));
   const remoteSumById = new Map((remoteIndex.shows || []).filter((row) => row?.id).map((row) => [row.id, row]));
   const merged = new Map();
-  for (const [id] of remoteSumById) {
+  for (const [id, sum] of remoteSumById) {
     if (localById.has(id) || knownShowIds.has(id)) continue;
-    const file = await githubGetFile(showFilePath(id));
-    if (!file.missing) {
-      fileShas.set(showFilePath(id), file.sha);
-      merged.set(id, JSON.parse(file.text));
-    }
+    merged.set(id, stubShow(sum));
   }
   for (const show of payload.shows || []) {
     if (!show?.id) continue;
-    const remoteSum = remoteSumById.get(show.id);
-    if (!remoteSum || (show.updatedAt || 0) >= (remoteSum.updatedAt || 0)) merged.set(show.id, show);
-    else if (!merged.has(show.id)) {
-      const file = await githubGetFile(showFilePath(show.id));
-      merged.set(show.id, file.missing ? show : JSON.parse(file.text));
-      if (!file.missing) fileShas.set(showFilePath(show.id), file.sha);
-    }
+    merged.set(show.id, pickShow(show, remoteSumById.get(show.id) ? stubShow(remoteSumById.get(show.id)) : null));
   }
   const shows = [...merged.values()].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
   rememberKnownShows(shows);
   for (const show of shows) {
     const local = localById.get(show.id);
     const remoteSum = remoteSumById.get(show.id);
-    if (!local || (remoteSum && (local.updatedAt || 0) < (remoteSum.updatedAt || 0))) continue;
+    if (!local || local._partial) continue;
+    if (remoteSum && (local.updatedAt || 0) < (remoteSum.updatedAt || 0)) continue;
     const path = showFilePath(show.id);
     await githubWriteFile(path, JSON.stringify(show), fileShas.get(path), branch);
   }
@@ -598,6 +611,7 @@ function bindGithub() {
       applyStored(combined);
     } catch (err) {
       if (err.code === "bad") {
+        cachedRepo = null;
         memoryGithub = null;
         localStorage.removeItem(GH_KEY);
         idbSet("github", null).catch(() => {});
@@ -616,6 +630,7 @@ function bindGithub() {
     }
   });
   logout?.addEventListener("click", () => {
+    cachedRepo = null;
     memoryGithub = null;
     localStorage.removeItem(GH_KEY);
     syncGithubLogout();
@@ -647,7 +662,6 @@ function queueGithubSave(payload) {
         const merged = await githubSave(next);
         if (!merged) return;
         rememberKnownShows(merged.shows);
-        await writeLocalArchive({ shows: merged.shows, activeId: merged.activeId });
         setMessage("");
       })
       .catch((err) => {
@@ -710,6 +724,7 @@ async function loadSharedStore() {
       return combined;
     } catch (err) {
       if (err.code === "bad") {
+        cachedRepo = null;
         memoryGithub = null;
         localStorage.removeItem(GH_KEY);
         syncGithubLogout();
@@ -1813,12 +1828,13 @@ function renderShows() {
   list.innerHTML = shows
     .map((show) => {
       const when = formatWhen(show.updatedAt || show.createdAt);
-      const decorCount = Array.isArray(show.decorations) ? show.decorations.length : 0;
-      const installCount = Array.isArray(show.installations) ? show.installations.length : 0;
+      const workN = show._partial ? show.workCount ?? "…" : show.works.filter((work) => !work.poster).length;
+      const decorCount = show._partial ? show.decorCount || 0 : (Array.isArray(show.decorations) ? show.decorations.length : 0);
+      const installCount = show._partial ? show.installCount || 0 : (Array.isArray(show.installations) ? show.installations.length : 0);
       return `<article class="show-card${show.id === activeId ? " active" : ""}" data-show="${show.id}">
         <button type="button" class="show-open" data-act="open">
           <strong>${escapeHtml(show.name)}</strong>
-          <span>${show.works.filter((work) => !work.poster).length} 件作品${installCount ? ` · ${installCount} 件装置` : ""}${decorCount ? ` · ${decorCount} 件装饰` : ""}${when ? ` · ${when}` : ""}</span>
+          <span>${workN} 件作品${installCount ? ` · ${installCount} 件装置` : ""}${decorCount ? ` · ${decorCount} 件装饰` : ""}${when ? ` · ${when}` : ""}</span>
         </button>
       </article>`;
     })
@@ -1876,7 +1892,25 @@ function createShow(name) {
   setStudio(false);
 }
 
-function openShow(id) {
+async function fillShowFromGithub(show) {
+  if (!show?._partial) return show;
+  const file = await githubGetFile(showFilePath(show.id));
+  if (file.missing) {
+    show._partial = false;
+    if (!Array.isArray(show.layout) || !show.layout.length) {
+      show.layout = baseLayout.map((spot) => ({ ...spot }));
+    }
+    return show;
+  }
+  const full = JSON.parse(file.text);
+  Object.assign(show, full);
+  show._partial = false;
+  fileShas.set(showFilePath(show.id), file.sha);
+  await writeLocalArchive({ shows, activeId });
+  return show;
+}
+
+async function openShow(id) {
   if (id === activeId) {
     setStudio(true);
     return;
@@ -1884,8 +1918,17 @@ function openShow(id) {
   persistActive();
   const show = shows.find((item) => item.id === id);
   if (!show) return;
+  if (show._partial) {
+    setMessage("正在打开展览…");
+    try {
+      await fillShowFromGithub(show);
+      setMessage("");
+    } catch (err) {
+      setMessage(explainGithub(err));
+      return;
+    }
+  }
   activateShow(show);
-  saveStore();
 }
 
 function deleteShow(id) {
