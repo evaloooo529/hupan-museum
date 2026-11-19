@@ -81,6 +81,76 @@ const GH_CONTENTS_LIMIT = 900000;
 let knownShowIds = new Set();
 let saveChain = Promise.resolve();
 let memoryGithub = null;
+let lastRemoteSha = null;
+let pendingSave = null;
+let saveTimer = 0;
+const IDB_NAME = "hupan-museum";
+const IDB_STORE = "kv";
+
+function openArchiveDb() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => {
+      if (!req.result.objectStoreNames.contains(IDB_STORE)) req.result.createObjectStore(IDB_STORE);
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function idbGet(key) {
+  try {
+    const db = await openArchiveDb();
+    return await new Promise((resolve, reject) => {
+      const req = db.transaction(IDB_STORE, "readonly").objectStore(IDB_STORE).get(key);
+      req.onsuccess = () => resolve(req.result ?? null);
+      req.onerror = () => reject(req.error);
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function idbSet(key, value) {
+  const db = await openArchiveDb();
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, "readwrite");
+    tx.objectStore(IDB_STORE).put(value, key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function loadLocalArchive() {
+  const idb = await idbGet("archive");
+  if (idb && Array.isArray(idb.shows)) return { shows: idb.shows, activeId: idb.activeId || null };
+  return loadStore();
+}
+
+async function writeLocalArchive(payload) {
+  try {
+    await idbSet("archive", payload);
+  } catch {
+    /* IndexedDB unavailable */
+  }
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+    localStorage.removeItem(LEGACY_KEY);
+  } catch {
+    /* archive is too large for localStorage; IndexedDB still holds it */
+  }
+}
+
+function waitMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetryable(err) {
+  if (!err) return false;
+  if (err.code === "rate") return true;
+  if (err.status === 500 || err.status === 502 || err.status === 503) return true;
+  return /Failed to fetch|NetworkError|Load failed|network/i.test(String(err.message || err.detail || ""));
+}
 
 function dataRepoName() {
   const meta = document.querySelector('meta[name="gallery-data-repo"]')?.content?.trim() || "";
@@ -113,6 +183,7 @@ function rememberGithub(partial) {
   } catch {
     /* private mode or quota; keep the token for this session */
   }
+  idbSet("github", next).catch(() => {});
 }
 
 function githubConfig() {
@@ -188,28 +259,41 @@ function githubHeaders(extra = {}) {
 async function githubRequest(path, options = {}) {
   const cfg = githubConfig();
   if (!cfg) {
-    const err = githubFault({ status: 401 }, { message: "Bad credentials" });
-    throw err;
+    throw githubFault({ status: 401 }, { message: "Bad credentials" });
   }
   const allowed = options.allowStatuses || [];
-  const res = await fetch(`https://api.github.com${path}`, {
-    cache: "no-store",
-    ...options,
-    headers: githubHeaders({
-      Accept: "application/vnd.github+json",
-      ...(options.headers || {}),
-    }),
-  });
-  const text = await res.text();
-  let body = null;
-  try {
-    body = text ? JSON.parse(text) : null;
-  } catch {
-    body = { message: text };
+  const { allowStatuses: _allow, ...rest } = options;
+  let lastErr = null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const res = await fetch(`https://api.github.com${path}`, {
+        cache: "no-store",
+        ...rest,
+        headers: githubHeaders({
+          Accept: "application/vnd.github+json",
+          ...(rest.headers || {}),
+        }),
+      });
+      const text = await res.text();
+      let body = null;
+      try {
+        body = text ? JSON.parse(text) : null;
+      } catch {
+        body = { message: text };
+      }
+      if (allowed.includes(res.status) || res.ok) return { res, body };
+      const err = githubFault(res, body);
+      if (!isRetryable(err) || attempt === 2) throw err;
+      lastErr = err;
+    } catch (err) {
+      if (err.code === "bad" || err.code === "perm" || err.code === "missing") throw err;
+      lastErr = err;
+      if (!isRetryable(err) && err.code && err.code !== "fail") throw err;
+      if (attempt === 2) throw err;
+    }
+    await waitMs(700 * (attempt + 1));
   }
-  if (allowed.includes(res.status)) return { res, body };
-  if (!res.ok) throw githubFault(res, body);
-  return { res, body };
+  throw lastErr;
 }
 
 function decodeGithubContent(body) {
@@ -277,12 +361,24 @@ async function githubLoad() {
   if (meta.res.ok && meta.body?.content && meta.body.encoding === "base64") {
     const loaded = parseArchive(decodeGithubContent(meta.body));
     rememberKnownShows(loaded.shows);
+    lastRemoteSha = sha;
     return { ...loaded, sha, branch };
   }
   if (!sha) throw githubFault(meta.res, meta.body || { message: "read" });
   const loaded = parseArchive(await githubBlobText(cfg, sha));
   rememberKnownShows(loaded.shows);
+  lastRemoteSha = sha;
   return { ...loaded, sha, branch };
+}
+
+async function githubMeta() {
+  const cfg = githubConfig();
+  const repo = await githubRequest(`/repos/${cfg.owner}/${cfg.repo}`, { allowStatuses: [404] });
+  if (repo.res.status === 404) throw githubFault(repo.res, repo.body);
+  const branch = repo.body.default_branch || cfg.branch || "main";
+  const meta = await githubRequest(`/repos/${cfg.owner}/${cfg.repo}/contents/${GH_PATH}`, { allowStatuses: [404, 403] });
+  if (meta.res.status === 404) return { sha: null, missing: true, branch };
+  return { sha: meta.body?.sha || null, missing: false, branch };
 }
 
 async function githubSaveBlob(cfg, text, branch) {
@@ -308,6 +404,7 @@ async function githubSaveBlob(cfg, text, branch) {
     method: "PATCH",
     body: JSON.stringify({ sha: next.body.sha }),
   });
+  return blob.body.sha;
 }
 
 async function githubPutFile(cfg, text, sha, branch) {
@@ -325,39 +422,44 @@ async function githubPutFile(cfg, text, sha, branch) {
 
 async function githubSave(payload) {
   const cfg = githubConfig();
-  const remote = await githubLoad();
-  const merged = mergeArchives(payload, remote.missing ? { shows: [], activeId: null } : remote);
+  const meta = await githubMeta();
+  let merged = payload;
+  if (!meta.missing && meta.sha && meta.sha !== lastRemoteSha) {
+    const remote = await githubLoad();
+    merged = mergeArchives(payload, remote.missing ? { shows: [], activeId: null } : remote);
+  }
   rememberKnownShows(merged.shows);
   const text = JSON.stringify(merged);
   const size = new TextEncoder().encode(text).length;
-  const branch = remote.branch || cfg.branch || "main";
+  const branch = meta.branch || cfg.branch || "main";
   if (size >= GH_CONTENTS_LIMIT) {
     try {
-      await githubSaveBlob(cfg, text, branch);
+      lastRemoteSha = await githubSaveBlob(cfg, text, branch);
     } catch (err) {
-      if (err.status !== 422 && err.code !== "fail") throw err;
+      if (err.status !== 422 && err.code !== "fail" && !isRetryable(err)) throw err;
       const again = await githubLoad();
       const retryPayload = mergeArchives(merged, again);
       rememberKnownShows(retryPayload.shows);
-      await githubSaveBlob(cfg, JSON.stringify(retryPayload), again.branch || branch);
+      lastRemoteSha = await githubSaveBlob(cfg, JSON.stringify(retryPayload), again.branch || branch);
       return retryPayload;
     }
     return merged;
   }
-  const put = await githubPutFile(cfg, text, remote.sha, branch);
+  const put = await githubPutFile(cfg, text, meta.sha, branch);
   if (put.res.status === 409) {
     const again = await githubLoad();
     const retryPayload = mergeArchives(merged, again);
-    const retryText = JSON.stringify(retryPayload);
-    const retry = await githubPutFile(cfg, retryText, again.sha, again.branch || branch);
+    const retry = await githubPutFile(cfg, JSON.stringify(retryPayload), again.sha, again.branch || branch);
     if (!retry.res.ok) throw githubFault(retry.res, retry.body);
     rememberKnownShows(retryPayload.shows);
+    lastRemoteSha = again.sha;
     return retryPayload;
   }
   if (!put.res.ok) {
-    await githubSaveBlob(cfg, text, branch);
+    lastRemoteSha = await githubSaveBlob(cfg, text, branch);
     return merged;
   }
+  lastRemoteSha = put.body?.content?.sha || lastRemoteSha;
   return merged;
 }
 
@@ -395,23 +497,27 @@ function bindGithub() {
       document.getElementById("github-gate").hidden = true;
       syncGithubLogout();
       if (remote.missing) {
-        const local = loadStore();
+        const local = await loadLocalArchive();
         if (local.shows.length) {
           applyStored({ ...local, upload: true });
           return;
         }
       }
-      try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify({ shows: remote.shows, activeId: remote.activeId }));
-      } catch {
-        /* the shared copy is still shown */
-      }
+      await writeLocalArchive({ shows: remote.shows, activeId: remote.activeId });
       applyStored(remote);
     } catch (err) {
       if (err.code === "bad") {
         memoryGithub = null;
         localStorage.removeItem(GH_KEY);
+        idbSet("github", null).catch(() => {});
         syncGithubLogout();
+      }
+      const local = await loadLocalArchive();
+      if (err.code !== "bad" && local.shows.length) {
+        document.getElementById("github-gate").hidden = true;
+        applyStored(local);
+        setMessage(explainGithub(err));
+        return;
       }
       showGithubGate(explainGithub(err));
     } finally {
@@ -439,41 +545,42 @@ function bindGithub() {
 }
 
 function queueGithubSave(payload) {
-  saveChain = saveChain
-    .then(() => githubSave(payload))
-    .then((merged) => {
-      if (!merged) return;
-      rememberKnownShows(merged.shows);
-      const open = currentShow();
-      const incoming = merged.shows.filter((show) => show && Array.isArray(show.works));
-      shows = incoming.map((show) => (open && show.id === open.id ? open : show));
-    })
-    .catch((err) => {
-      if (err.code === "bad") {
-        memoryGithub = null;
-        localStorage.removeItem(GH_KEY);
-        syncGithubLogout();
-        showGithubGate(explainGithub(err));
-        return;
-      }
-      if (err.code === "perm") {
-        setMessage("当前令牌不能写入。请把 Contents 设为 Read and write 后重新连接。");
-        return;
-      }
-      setMessage(explainGithub(err) || "这次修改没能同步到其他设备。");
-    });
+  pendingSave = payload;
+  window.clearTimeout(saveTimer);
+  saveTimer = window.setTimeout(() => {
+    const next = pendingSave;
+    pendingSave = null;
+    saveChain = saveChain
+      .then(async () => {
+        setMessage("正在同步到其他设备…");
+        const merged = await githubSave(next);
+        if (!merged) return;
+        rememberKnownShows(merged.shows);
+        await writeLocalArchive({ shows: merged.shows, activeId: merged.activeId });
+        setMessage("");
+      })
+      .catch((err) => {
+        if (err.code === "bad") {
+          memoryGithub = null;
+          localStorage.removeItem(GH_KEY);
+          syncGithubLogout();
+          showGithubGate(explainGithub(err));
+          return;
+        }
+        if (err.code === "perm") {
+          setMessage("当前令牌不能写入。请把 Contents 设为 Read and write 后重新连接。本机这次修改已经记下。");
+          return;
+        }
+        setMessage(`${explainGithub(err)} 本机已经记下，其他设备稍后再刷新。`);
+      });
+  }, 1600);
 }
 
 function saveStore() {
   persistActive();
   const payload = { shows, activeId };
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
-    localStorage.removeItem(LEGACY_KEY);
-    setMessage("");
-  } catch {
-    setMessage("展区内容太多或图片太大，这次没能保存在本机浏览器。其他设备仍以 GitHub 上的存档为准。");
-  }
+  writeLocalArchive(payload).catch(() => {});
+  setMessage("");
   if (githubConfig()) {
     queueGithubSave(payload);
     return;
@@ -495,29 +602,33 @@ function saveStore() {
 }
 
 async function loadSharedStore() {
-  const local = loadStore();
+  const savedGh = await idbGet("github");
+  if (savedGh?.token && !githubConfig()) memoryGithub = savedGh;
+  const local = await loadLocalArchive();
   if (hostedOnGithub()) {
     if (!githubConfig()) {
       showGithubGate();
-      return { shows: [], activeId: null, hold: true };
+      return { shows: local.shows, activeId: local.activeId, hold: !local.shows.length };
     }
     try {
       const remote = await githubLoad();
       if (remote.missing && local.shows.length) return { ...local, upload: true };
-      try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify({ shows: remote.shows, activeId: remote.activeId }));
-      } catch {
-        /* this browser can still show the shared copy */
-      }
+      await writeLocalArchive({ shows: remote.shows, activeId: remote.activeId });
       return remote;
     } catch (err) {
       if (err.code === "bad") {
         memoryGithub = null;
         localStorage.removeItem(GH_KEY);
         syncGithubLogout();
+        showGithubGate(explainGithub(err));
+        return { shows: local.shows, activeId: local.activeId, hold: !local.shows.length };
+      }
+      if (local.shows.length) {
+        setMessage(`${explainGithub(err)} 先显示本机上次保存的展览。`);
+        return local;
       }
       showGithubGate(explainGithub(err));
-      return { shows: local.shows, activeId: local.activeId, hold: !local.shows.length };
+      return { shows: [], activeId: null, hold: true };
     }
   }
   try {
